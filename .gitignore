@@ -1,0 +1,9 @@
+node_modules/
+# 只忽略本地全国公司库（1902.8 MB，超出 GitHub 单文件 100 MB 上限）
+/data/companies.db
+/data/companies.db-journal
+/data/companies.db-wal
+/data/companies.db-shm
+.vercel/
+.DS_Store
+*.log
