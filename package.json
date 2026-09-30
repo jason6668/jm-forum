@@ -1,0 +1,18 @@
+{
+  "name": "my-forum",
+  "version": "1.0.0",
+  "description": "Discourse-style forum with custom logo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.22.2"
+  }
+}
