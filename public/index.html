@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JM 社区 - 分享、交流、发现</title>
+  <meta name="description" content="JM 社区：一个技术、情报、日常与职场互助的交流社区。支持发帖、回复、签到领鸡腿、公司避雷库、站内私信与通知。" />
+  <meta property="og:title" content="JM 社区 - 分享、交流、发现" />
+  <meta property="og:description" content="技术、情报、日常与职场互助交流社区，含重庆公司避雷库。" />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="/assets/logo.png" />
+  <link rel="icon" href="/assets/logo.png" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#3d6c45" />
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ====== 顶部导航 ====== -->
+    <header class="d-header">
+      <div class="nav-inner">
+        <div class="nav-left">
+          <button class="menu-toggle" id="menuToggle" aria-label="打开菜单">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+          </button>
+          <a class="logo" href="/">
+            <img src="/assets/logo.png" alt="logo" />
+            <span class="site-name">JM 社区</span>
+          </a>
+          <nav class="nav-pills" id="navPills">
+            <a href="/" data-nav="home">首页</a>
+            <a href="/boards" data-nav="boards">板块</a>
+            <a href="/rank" data-nav="rank">排行榜</a>
+            <a href="/shop" data-nav="shop">🛒 商城</a>
+            <a href="/companies" data-nav="companies">🏢 避雷库</a>
+            <a href="/compose" data-nav="compose" class="nav-post-btn">发帖</a>
+          </nav>
+        </div>
+        <div class="nav-right">
+          <button class="icon-btn" id="darkToggle" title="切换深浅色">🌙</button>
+          <div class="bell-wrap" id="bellWrap">
+            <button class="icon-btn" id="bellBtn" title="通知">🔔<span class="bell-dot hidden" id="bellDot"></span></button>
+            <div class="bell-dropdown hidden" id="bellDropdown"></div>
+          </div>
+          <form class="nav-search" id="navSearchForm">
+            <svg viewBox="0 0 24 24" width="15" height="15"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2" fill="none"/><path d="M20 20l-4.3-4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <input type="text" id="navSearchInput" placeholder="搜索帖子 / 作者 / 标签..." />
+          </form>
+          <button class="btn-checkin" id="checkinBtn" title="每日签到领鸡腿">🍗 签到</button>
+          <div class="auth-buttons" id="authButtons">
+            <a href="/login" class="btn btn-login">登录</a>
+            <a href="/register" class="btn btn-primary">注册</a>
+          </div>
+          <div class="user-menu hidden" id="userMenu">
+            <button class="user-btn" id="userBtn">
+              <img class="avatar" id="currentAvatar" src="/assets/logo.png" alt="avatar" />
+              <span class="user-coin" id="userCoins" title="我的鸡腿">🍗 0</span>
+            </button>
+            <div class="dropdown hidden" id="userDropdown">
+              <a href="/space/me" id="profileLink">我的主页</a>
+              <a href="/messages">💬 私信<span class="dm-badge hidden" id="dmBadge"></span></a>
+              <a href="/favorites">我的收藏</a>
+              <a href="/achievements">🏅 成就墙</a>
+              <a href="/companies/watch">🛡️ 我的避雷清单</a>
+              <a href="/shop">🛒 积分商城</a>
+              <a href="/settings">设置</a>
+              <a href="/admin" id="adminLink" class="hidden">🛡️ 管理后台</a>
+              <div class="sep"></div>
+              <a href="#" id="logoutBtn">退出登录</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ====== 移动端侧边抽屉 ====== -->
+    <aside class="mobile-drawer" id="mobileDrawer">
+      <div class="drawer-inner">
+        <a class="drawer-brand" href="/">
+          <img src="/assets/logo.png" alt="logo" /><span>JM 社区</span>
+        </a>
+        <div class="drawer-links">
+          <a href="/">🏠 首页</a>
+          <a href="/boards">📂 板块</a>
+          <a href="/rank">🏆 排行榜</a>
+          <a href="/shop">🛒 商城</a>
+          <a href="/companies">🏢 避雷库</a>
+          <a href="/compose">✍️ 发帖</a>
+          <a href="/messages">💬 私信</a>
+          <a href="/favorites">⭐ 我的收藏</a>
+          <a href="/about">ℹ️ 关于社区</a>
+        </div>
+      </div>
+    </aside>
+    <div class="overlay hidden" id="overlay"></div>
+
+    <!-- ====== 主体 ====== -->
+    <div class="layout">
+      <main class="main" id="mainContent">
+        <div class="loading" id="pageLoading">加载中...</div>
+        <div id="pageRoot"></div>
+      </main>
+      <aside class="sidebar-right" id="sidebarRight">
+        <!-- 签到面板 -->
+        <div class="side-card checkin-card">
+          <h3>每日签到</h3>
+          <div class="checkin-body" id="checkinPanel">
+            <p class="muted">登录后每日签到，领取 3~5 个鸡腿 🍗</p>
+            <a href="/login" class="btn btn-primary btn-block">登录签到</a>
+          </div>
+        </div>
+        <!-- 签到排行 -->
+        <div class="side-card">
+          <div class="side-card-head">
+            <h3>今日签到榜</h3>
+            <a href="/rank" class="more">更多</a>
+          </div>
+          <ol class="rank-list" id="checkinRankList">
+            <li class="muted">加载中...</li>
+          </ol>
+        </div>
+        <!-- 板块 -->
+        <div class="side-card">
+          <h3>板块</h3>
+          <ul class="side-board-list" id="sideBoardList"></ul>
+        </div>
+        <!-- 标签云 -->
+        <div class="side-card">
+          <h3>热门标签</h3>
+          <div class="side-tags" id="sideTags"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- 回到顶部 -->
+  <button id="toTop" class="to-top hidden" title="回到顶部" aria-label="回到顶部">↑</button>
+
+  <script src="/js/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('/sw.js').catch(function () {});
+      });
+    }
+  </script>
+</body>
+</html>
