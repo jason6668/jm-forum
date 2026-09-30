@@ -1,0 +1,16 @@
+{
+  "name": "JM 社区",
+  "short_name": "JM社区",
+  "description": "分享、交流、发现的社区论坛",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#eaf4ec",
+  "theme_color": "#3d6c45",
+  "icons": [
+    { "src": "/assets/logo.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/assets/logo.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
