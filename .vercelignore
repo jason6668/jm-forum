@@ -1,0 +1,22 @@
+# Vercel 部署忽略清单
+# ⚠️ 排除根目录 data/（含 1.9GB 全国公司库 companies.db 与本地演示数据 db.json；线上走 KV 无需带上）
+# ⚠️ public/data/companies.json（5.1MB 降级名录）必须上传，不要排除
+/data
+
+# 依赖与版本控制
+/node_modules
+/.git
+/.vercel
+
+# 本地专用脚本与测试，不需要上云
+/test_upgrade.js
+/test_features.js
+/test_companies.js
+/test_play.js
+/genCompanies.js
+/start.bat
+/start.sh
+
+# 杂项
+.DS_Store
+*.log
