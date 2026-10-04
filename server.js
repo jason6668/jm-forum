@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const notify = require('./notify');
 const seedCompanies = require('./seedCompanies');
 /* Node 22 内置 SQLite（全国公司库 v9 用）；老 Node / Vercel 环境不可用时自动降级为静态名录 */
@@ -41,13 +42,18 @@ async function kvGet() {
   if (!res.ok) throw new Error('KV get ' + res.status);
   const data = await res.json();
   if (data.result === null || data.result === undefined) return null;
+  /* 新格式：gz1: 前缀 = gzip+base64 压缩存储（整库 JSON 已超 KV 单值上限，必须压缩） */
+  if (typeof data.result === 'string' && data.result.startsWith('gz1:')) {
+    return JSON.parse(require('zlib').gunzipSync(Buffer.from(data.result.slice(4), 'base64')).toString('utf8'));
+  }
   return typeof data.result === 'string' ? JSON.parse(data.result) : data.result;
 }
 async function kvSet(db) {
+  const packed = 'gz1:' + require('zlib').gzipSync(Buffer.from(JSON.stringify(db), 'utf8')).toString('base64');
   const res = await fetch(`${KV_BASE}/set/${DB_KEY}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(db),
+    body: packed,
   });
   if (!res.ok) throw new Error('KV set ' + res.status);
 }
@@ -66,8 +72,9 @@ function saveDb(db) {
 async function flushNow() {
   if (!IS_VERCEL) return;
   if (kvTimer) { clearTimeout(kvTimer); kvTimer = null; }
-  try { await kvSet(cacheDb); } catch (e) { console.error('KV flush failed:', e.message); }
+  try { await kvSet(cacheDb); lastKvError = ''; } catch (e) { lastKvError = String(e.message || e).slice(0, 200); console.error('KV flush failed:', e.message); }
 }
+let lastKvError = '';
 function loadDb() {
   if (IS_VERCEL) return cacheDb;
   ensureDb();
@@ -83,7 +90,7 @@ function genRegCode() {
   return 'JM-' + s;
 }
 function seedRegCodes() {
-  return Array.from({ length: 5 }, () => ({ id: id('rc'), code: genRegCode(), note: '演示注册码（管理后台可生成新码）', usedBy: null, usedAt: null, createdAt: nowIso() }));
+  return Array.from({ length: 5 }, () => ({ id: id('rc'), code: genRegCode(), note: '演示注册码（管理后台可生成新码）', usedBy: null, usedAt: null, createdAt: nowIso(), createdBy: null, maxUses: 1, usedCount: 0, usedByList: [] }));
 }
 /* 数据库结构升级：老数据自动补齐新字段/新板块，不覆盖已有内容 */
 function migrate(db) {
@@ -134,6 +141,50 @@ function migrate(db) {
   if (!Array.isArray(db.messages)) db.messages = [];
   if (!Array.isArray(db.notifications)) db.notifications = [];
   if (!Array.isArray(db.reports)) db.reports = [];
+  /* ⚖️ 管理记录公示 */
+  if (!Array.isArray(db.modLogs)) db.modLogs = [];
+  /* 🎲 幸运抽奖 */
+  if (!Array.isArray(db.lotteries)) db.lotteries = [];
+  /* 📢 全站公告 */
+  if (!Array.isArray(db.announcements)) db.announcements = [];
+  /* 📰 新闻播报机器人（每日自动抓取热榜发帖） */
+  if (!db.users.find(u => u.username === 'newsbot')) {
+    db.users.push({
+      id: id('u'), username: 'newsbot', name: '瓜田播报员', passwordHash: '',
+      avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
+      checkinCoins: 0, lastCheckin: '', favorites: [],
+      bio: '🤖 每天早上 8 点自动播报全网热点，吃瓜不迷路',
+      signature: '', readme: '', contacts: {}, preferences: {},
+      blocked: false, exp: 0, badges: [], title: '', achievements: {},
+      checkinCount: 0, following: [],
+    });
+  }
+  /* ⚽ 体育专区（对标虎扑：各球类独立板块） */
+  const SPORT_BOARDS = [
+    { name: '篮球', slug: 'basketball', color: '#f97316', description: 'NBA、CBA、野球场：聊球看球评球' },
+    { name: '足球', slug: 'football', color: '#22c55e', description: '五大联赛、中超、欧冠：世界第一运动' },
+    { name: '网球', slug: 'tennis', color: '#a3e635', description: '四大满贯、ATP、WTA' },
+    { name: '羽毛球', slug: 'badminton', color: '#eab308', description: '苏杯汤尤杯、世锦赛、奥运争光' },
+    { name: '乒乓球', slug: 'pingpong', color: '#ef4444', description: 'WTT、世乒赛，国球无敌' },
+    { name: '排球', slug: 'volleyball', color: '#3b82f6', description: '中国女排、联赛、世锦赛' },
+    { name: '台球', slug: 'billiards', color: '#8b5cf6', description: '斯诺克、中式八球、九球' },
+    { name: '棒球', slug: 'baseball', color: '#f43f5e', description: 'MLB、日职棒、世界棒球经典赛' },
+    { name: '高尔夫', slug: 'golf', color: '#10b981', description: '大满贯、PGA、挥杆人生' },
+    { name: '电竞', slug: 'esports', color: '#6366f1', description: 'LOL、CS2、王者荣耀、DOTA2' },
+    { name: '综合体育', slug: 'sports', color: '#06b6d4', description: '田径、游泳、F1、健身及其他运动' },
+  ];
+  SPORT_BOARDS.forEach(s => {
+    if (!db.boards.find(b => b.slug === s.slug)) {
+      db.boards.push({ id: id('b'), name: s.name, slug: s.slug, color: s.color, description: s.description, topicCount: 0, weight: 100 + SPORT_BOARDS.indexOf(s) * 10 });
+    }
+  });
+  /* 福利分享板块（对标 linux.do 福利区） */
+  if (!db.boards.find(b => b.slug === 'fuli')) {
+    db.boards.push({ id: id('b'), name: '福利分享', slug: 'fuli', color: '#f59e0b', description: '羊毛福利、资源分享、网盘互助', topicCount: 0, weight: 95,
+      topicTemplate: '【福利名称】\n\n【领取方式】\n\n【有效期】\n\n【备注】' });
+  }
+  /* 板块排序权重：老板块按原顺序 */
+  db.boards.forEach((b, i) => { if (typeof b.weight !== 'number') b.weight = (i + 1) * 10; });
   /* v8 升级：等级体系 / 积分商城 / 打赏悬赏 / 投票 / 成就 / 鸡腿交易 */
   if (!Array.isArray(db.shopItems) || !db.shopItems.length) db.shopItems = seedShop();
   if (!Array.isArray(db.transfers)) db.transfers = [];
@@ -150,6 +201,14 @@ function migrate(db) {
 function slugify(str) { return String(str).toLowerCase().replace(/[^\w\u4e00-\u9fa5]+/g, '-').replace(/^-|-$/g, '').slice(0, 80) || 'post'; }
 function nowIso() { return new Date().toISOString(); }
 function id(p = '') { return p + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+/* 会话令牌：256 位真随机（原 id('s') 仅 Math.random+时间戳，熵不足，2026-10-04 升级） */
+function newSessionToken() { return 's' + crypto.randomBytes(32).toString('hex'); }
+/* ---- ⚖️ 管理记录（公开可查） ---- */
+function modLog(db, action, adminUser, targetName, detail) {
+  if (!Array.isArray(db.modLogs)) db.modLogs = [];
+  db.modLogs.unshift({ id: id('m'), action, admin: adminUser ? adminUser.name : '系统', adminId: adminUser ? adminUser.id : '', target: targetName || '', detail: detail || '', createdAt: nowIso() });
+  if (db.modLogs.length > 500) db.modLogs.length = 500;
+}
 /* ---- 站内通知 ---- */
 /* 扫描正文中的 @用户名（中文/字母/数字/下划线/连字符，2-20 位），返回被提及用户列表 */
 function scanMentions(db, content, excludeId) {
@@ -186,7 +245,7 @@ function defaultProfile() {
 function seed(db) {
   if (db.boards && db.boards.length) return;
 
-  const users = [
+  const seedUsers = [
     ['admin', '管理员', 4, 'admin', 120], ['alice', 'Alice', 3, 'user', 45], ['bob', 'Bob', 2, 'user', 30],
     ['carol', 'Carol', 2, 'user', 38], ['dave', 'Dave', 1, 'user', 15], ['eve', 'Eve', 1, 'user', 22],
     ['frank', 'Frank', 1, 'user', 9], ['grace', 'Grace', 2, 'user', 27], ['heidi', 'Heidi', 1, 'user', 14],
@@ -195,7 +254,9 @@ function seed(db) {
     ['victor', 'Victor', 1, 'user', 20], ['wendy', 'Wendy', 1, 'user', 16], ['xavier', 'Xavier', 1, 'user', 8],
     ['yolanda', 'Yolanda', 1, 'user', 10], ['zara', 'Zara', 1, 'user', 13],
   ];
-  const adminPwd = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6).toUpperCase() + '!8';
+  /* 云端全新部署只保留管理员账号，不造假用户（本地保留完整演示数据） */
+  const users = IS_VERCEL ? [seedUsers[0]] : seedUsers;
+  const adminPwd = process.env.ADMIN_PASSWORD || (Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6).toUpperCase() + '!8');
   const userPwd = Math.random().toString(36).slice(2, 12);
   db.users = users.map(([username, name, trust, role, coins]) => ({
     id: id('u'), username, name, email: username + '@example.com', passwordHash: hashPw(username === 'admin' ? adminPwd : userPwd),
@@ -207,7 +268,7 @@ function seed(db) {
   console.log('│  首次启动 - 初始账号信息（请妥善保管）       │');
   console.log('│  管理员账号: admin                           │');
   console.log('│  管理员密码: ' + adminPwd.padEnd(33) + '│');
-  console.log('│  其他种子用户密码: ' + userPwd.padEnd(25) + '│');
+  if (!IS_VERCEL) console.log('│  其他种子用户密码: ' + userPwd.padEnd(25) + '│');
   console.log('│  ⚠️ 请登录后立即修改密码！                    │');
   console.log('└─────────────────────────────────────────────┘');
 
@@ -223,6 +284,24 @@ function seed(db) {
   ];
 
   db.tags = ['置顶', '公告', '推荐', '教程', '求助', '分享', '开源', '优惠', '讨论', '水贴'].map(t => ({ id: id('t'), name: t }));
+
+  if (IS_VERCEL) {
+    /* 云端全新部署：只留一篇欢迎帖，不造假帖/假数据 */
+    const admin = db.users[0];
+    const board = db.boards[0];
+    const topicId = id('tp');
+    const welcome = '欢迎来到 JM 社区！\n\n这是一个开放、友善、有料的社区，祝你在这里有所收获。\n\n**社区规范**\n\n1. 友善交流，不人身攻击\n2. 交易帖请标明价格与配置\n3. 不发布违法或侵权内容\n\n违规内容管理员将视情节删帖或封号。';
+    db.topics = [{
+      id: topicId, title: '欢迎来到 JM 社区 —— 新人必读', slug: 'welcome', boardId: board.id,
+      userId: admin.id, createdAt: nowIso(), bumpedAt: nowIso(),
+      viewCount: 0, replyCount: 0, likeCount: 0, tags: ['公告'],
+      posts: [{ id: id('p'), topicId, userId: admin.id, content: welcome, createdAt: nowIso(), likeCount: 0, postNumber: 1 }],
+      pinned: true, recommended: false, price: 0, closed: false, favoriteCount: 0, favoritedUsers: [],
+    }];
+    board.topicCount = 1;
+    saveDb(db);
+    return;
+  }
 
   const seedPosts = [
     // [boardIdx, title, contentIdx, userIdx, views, comments, pinned, recommended, tags]
@@ -386,7 +465,7 @@ function userPublic(u) {
     preferences: u.preferences || defaultProfile().preferences,
     blocked: u.blocked || [],
     exp: lv.exp, level: lv.level, levelTitle: lv.levelTitle, nextExp: lv.nextExp, levelProgress: lv.progress,
-    badges: u.badges || [], title: u.title || '', titleExpireAt: u.titleExpireAt || null,
+    badges: u.badges || [], title: u.title || '', titles: u.titles || [], titleExpireAt: u.titleExpireAt || null,
     achievements: u.achievements || [], checkinCount: u.checkinCount || 0,
     followingCount: (u.following || []).length,
   };
@@ -395,6 +474,16 @@ function userPublic(u) {
 /* ================= helpers ================= */
 function boardById(db, id) { return db.boards.find(b => b.id === id); }
 function boardBySlug(db, slug) { return db.boards.find(b => b.slug === slug); }
+
+/* TG 评论者专属头像：按名字哈希定色 + 首字，同名同头像、不同人不同样 */
+function tgAvatarUri(name) {
+  const s = String(name || 'TG用户');
+  let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  const ch = ([...s.trim()][0] || 'T').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><rect width='64' height='64' rx='14' fill='hsl(${hue},55%,45%)'/><text x='32' y='43' font-size='30' text-anchor='middle' fill='#ffffff' font-family='sans-serif'>${ch}</text></svg>`;
+  return 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf8').toString('base64');
+}
 
 function enrichTopic(t, db, opts = {}) {
   const board = boardById(db, t.boardId);
@@ -405,23 +494,54 @@ function enrichTopic(t, db, opts = {}) {
     id: t.id, userId: t.userId, title: t.title, slug: t.slug, excerpt: (t.posts[0]?.content || '').slice(0, 120),
     board: board ? { id: board.id, name: board.name, slug: board.slug, color: board.color } : null,
     author: userPublic(author), createdAt: t.createdAt, bumpedAt: t.bumpedAt,
-    viewCount: t.viewCount, replyCount: t.replyCount, likeCount: t.likeCount,
+    viewCount: t.viewCount, replyCount: t.replyCount, likeCount: t.likeCount, dislikeCount: t.dislikeCount || 0,
     favoriteCount: t.favoriteCount || 0, tags: t.tags || [], pinned: t.pinned, recommended: t.recommended,
     closed: t.closed, price: t.price || 0, bounty: t.bounty || 0, bestReplyId: t.bestReplyId || null,
+    prefix: t.prefix || '', minLevel: t.minLevel || 1, slowMode: t.slowMode || 0,
     poll: t.poll ? {
       question: t.poll.question, multi: t.poll.multi,
       options: opts.withPosts ? t.poll.options.map((o, i) => ({ text: o.text, votes: o.votes.length, ratio: t.poll.voters.length ? Math.round(o.votes.length / t.poll.voters.length * 100) : 0, myPick: opts.userId ? o.votes.includes(opts.userId) : false })) : undefined,
       total: (t.poll.voters || []).length, myVote: opts.userId ? (t.poll.voters || []).findIndex(v => v === opts.userId) : -1,
     } : null,
     likedByMe: !!opts.userId && (t.likedUsers || []).includes(opts.userId),
-    lastReply: lastReply ? { username: lastReply.username, name: lastReply.name, avatar: lastReply.avatar, at: lastPost.createdAt } : null,
+    status: t.status || 'published', anonymous: !!t.anonymous, tgSubmitter: t.tgSubmitter || '',
+    dislikedByMe: !!opts.userId && (t.dislikedUsers || []).includes(opts.userId),
+    reactions: (() => { const st = {}; for (const e of ['❤️','😂','😮','😢','👏','🔥']) st[e] = { count: ((t.reactions || {})[e] || []).length, mine: !!opts.userId && ((t.reactions || {})[e] || []).includes(opts.userId) }; return st; })(),
+    lastReply: lastReply ? { username: lastReply.username, name: lastPost.authorName || lastReply.name, avatar: lastPost.authorName ? tgAvatarUri(lastPost.authorName) : lastReply.avatar, at: lastPost.createdAt } : null,
   };
-  if (opts.withPosts) obj.posts = t.posts.map(p => ({ ...p, author: userPublic(db.users.find(u => u.id === p.userId)), likedByMe: !!opts.userId && (p.likedUsers || []).includes(opts.userId) }));
+  if (opts.withPosts) obj.posts = t.posts.map(p => {
+    const au = userPublic(db.users.find(u => u.id === p.userId));
+    /* 镜像评论显示原作者名 + 专属头像，不挂机器人名下（用户定） */
+    return { ...p, author: p.authorName && au ? { ...au, name: p.authorName, avatar: tgAvatarUri(p.authorName) } : au, likedByMe: !!opts.userId && (p.likedUsers || []).includes(opts.userId) };
+  });
+  if (t.anonymous && obj.author) obj.author = { ...obj.author, name: '匿名', username: 'anonymous' };
   return obj;
 }
 
+/* ================= 限流（防爆破 / 防刷帖） ================= */
+/* 内存桶限流：Serverless 下按实例生效，可挡常规单点刷请求 */
+const rlStore = new Map();
+function rateLimit(name, { windowMs, max, byUser }) {
+  return (req, res, next) => {
+    const who = (byUser && req.user) ? 'u:' + req.user.id
+      : 'ip:' + ((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '?');
+    const nowMs = Date.now();
+    if (rlStore.size > 2000) for (const [k, v] of rlStore) if (v.reset <= nowMs) rlStore.delete(k);
+    const k = name + '|' + who;
+    let b = rlStore.get(k);
+    if (!b || b.reset <= nowMs) b = { count: 0, reset: nowMs + windowMs };
+    b.count++;
+    rlStore.set(k, b);
+    if (b.count > max) return res.status(429).json({ error: '操作太频繁，请稍后再试' });
+    next();
+  };
+}
+const rlAuth = rateLimit('auth', { windowMs: 10 * 60 * 1000, max: 30 });                 // 登录/注册：同 IP 10 分钟 30 次
+const rlTopic = rateLimit('topic', { windowMs: 60 * 60 * 1000, max: 30, byUser: true });  // 发帖：每用户每小时 30 帖
+const rlReply = rateLimit('reply', { windowMs: 60 * 60 * 1000, max: 200, byUser: true }); // 回复：每用户每小时 200 条
+
 /* ================= auth API ================= */
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', rlAuth, async (req, res) => {
   try {
     const { username, email, password, name, code } = req.body || {};
     if (!username || !email || !password) return res.status(400).json({ error: '缺少必填字段' });
@@ -431,40 +551,80 @@ app.post('/api/auth/register', async (req, res) => {
     const regCode = String(code || '').trim().toUpperCase();
     if (!regCode) return res.status(400).json({ error: '注册需要注册码，请联系管理员获取' });
     const rc = (db.regCodes || []).find(c => c.code.toUpperCase() === regCode);
-    if (!rc) return res.status(400).json({ error: '注册码无效，请检查后重试' });
-    if (rc.usedBy) return res.status(400).json({ error: '该注册码已被使用，不能重复注册' });
+    if (!rc) return res.status(400).json({ error: '邀请码无效，请检查后重试' });
+    /* 兼容老单次码 + 新多次邀请码 */
+    const maxUses = Math.max(1, rc.maxUses || 1);
+    const usedCount = rc.usedCount || (rc.usedBy ? 1 : 0);
+    if (usedCount >= maxUses) return res.status(400).json({ error: '该邀请码已用完，换一个试试' });
+    if (rc.expiresAt && new Date(rc.expiresAt) < new Date()) return res.status(400).json({ error: '该邀请码已过期' });
     const profile = defaultProfile();
     const user = { id: id('u'), username, email, name: name || username, passwordHash: hashPw(password), avatar: null, createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 10, checkinCoins: 0, lastCheckin: '', favorites: [], banned: false, ...profile };
     db.users.push(user);
-    rc.usedBy = user.id;
+    rc.usedBy = rc.usedBy || user.id;
     rc.usedAt = nowIso();
-    const token = id('s');
+    rc.usedCount = (rc.usedCount || 0) + 1;
+    rc.usedByList = rc.usedByList || [];
+    rc.usedByList.push(user.id);
+    user.invitedBy = rc.createdBy || null;
+    /* 邀请人奖励 +20 鸡腿 */
+    if (rc.createdBy) {
+      const inviter = db.users.find(u => u.id === rc.createdBy);
+      if (inviter) {
+        inviter.coins = (inviter.coins || 0) + 20;
+        addNotification(db, inviter.id, 'invite_reward', { fromName: user.name || user.username, coins: 20 });
+      }
+    }
+    const token = newSessionToken();
     db.sessions[token] = { userId: user.id, expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() };
     saveDb(db);
     await flushNow();
     notify.notifyAll(db, 'newUser', { username: user.username, name: user.name || user.username }).catch(() => {});
-    res.cookie('forum_session', token, { signed: true, httpOnly: true, maxAge: 7 * 24 * 3600 * 1000, sameSite: 'lax' });
+    res.cookie('forum_session', token, { signed: true, httpOnly: true, maxAge: 7 * 24 * 3600 * 1000, sameSite: 'lax', secure: IS_VERCEL });
     res.json({ user: userPublic(user) });
   } catch (e) {
     res.status(500).json({ error: '注册失败：' + e.message });
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rlAuth, async (req, res) => {
   try {
     const { account, password } = req.body || {};
     const db = loadDb();
     const user = db.users.find(u => u.username === account || u.email === account);
     if (!user || !checkPw(password, user.passwordHash)) return res.status(401).json({ error: '账号或密码错误' });
     if (user.banned) return res.status(403).json({ error: '账号已被封禁，如有疑问请联系管理员' });
-    const token = id('s');
+    const token = newSessionToken();
     db.sessions[token] = { userId: user.id, expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() };
     saveDb(db);
     await flushNow();
-    res.cookie('forum_session', token, { signed: true, httpOnly: true, maxAge: 7 * 24 * 3600 * 1000, sameSite: 'lax' });
+    res.cookie('forum_session', token, { signed: true, httpOnly: true, maxAge: 7 * 24 * 3600 * 1000, sameSite: 'lax', secure: IS_VERCEL });
     res.json({ user: userPublic(user) });
   } catch (e) {
     res.status(500).json({ error: '登录失败：' + e.message });
+  }
+});
+
+/* 站内改密（2026-10-04 升级）：验旧密→换哈希→踢掉其他设备的会话，当前设备保持登录 */
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword) return res.status(400).json({ error: '请填写当前密码和新密码' });
+    if (String(newPassword).length < 6) return res.status(400).json({ error: '新密码至少 6 位' });
+    if (String(newPassword) === String(currentPassword)) return res.status(400).json({ error: '新密码不能和当前密码相同' });
+    const db = loadDb();
+    const me = db.users.find(u => u.id === req.user.id);
+    if (!me) return res.status(404).json({ error: '用户不存在' });
+    if (!checkPw(currentPassword, me.passwordHash)) return res.status(401).json({ error: '当前密码不正确' });
+    me.passwordHash = hashPw(String(newPassword));
+    let kicked = 0;
+    for (const tk of Object.keys(db.sessions || {})) {
+      if (tk !== req.token && db.sessions[tk].userId === me.id) { delete db.sessions[tk]; kicked++; }
+    }
+    saveDb(db);
+    await flushNow();
+    res.json({ ok: true, kicked });
+  } catch (e) {
+    res.status(500).json({ error: '修改失败：' + e.message });
   }
 });
 
@@ -515,20 +675,106 @@ app.post('/api/settings', requireAuth, (req, res) => {
 });
 
 /* ================= boards & tags ================= */
-app.get('/api/boards', (req, res) => res.json(loadDb().boards));
+app.get('/api/boards', (req, res) => {
+  const boards = loadDb().boards.slice().sort((a, b) => (a.weight || 0) - (b.weight || 0));
+  res.json(boards);
+});
 
 app.get('/api/tags', (req, res) => res.json(loadDb().tags));
 
 /* ================= topics ================= */
+/* 📡 RSS 订阅：最新 30 个主题 */
+app.get('/rss.xml', (req, res) => {
+  const db = loadDb();
+  const base = 'https://bbs.8818618.xyz';
+  const xmlEsc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  // 摘要：先把存量内容里的 HTML 实体还原，再剥掉 Markdown/HTML，压成纯文本单行，避免阅读器里出现 &#x2F; 之类乱码
+  const decodeEnt = s => String(s || '').replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (m, e) => {
+    if (e[0] === '#') {
+      const n = (e[1] === 'x' || e[1] === 'X') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+    }
+    return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' })[e] || m;
+  });
+  const excerpt = s => decodeEnt(String(s || ''))
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/(\*\*|__|\*|_|~~|`)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim().slice(0, 280);
+  const items = db.topics.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 30).map(t => {
+    const author = db.users.find(u => u.id === t.userId);
+    const link = `${base}/post/${t.slug || t.id}`;
+    return `<item><title>${xmlEsc(t.title)}</title><link>${xmlEsc(encodeURI(link))}</link><guid>${xmlEsc(encodeURI(link))}</guid>`
+      + `<dc:creator>${xmlEsc(author ? author.name : '')}</dc:creator>`
+      + `<pubDate>${new Date(t.createdAt).toUTCString()}</pubDate>`
+      + `<description>${xmlEsc(excerpt(t.posts[0]?.content || ''))}</description></item>`;
+  }).join('');
+  res.type('application/rss+xml; charset=utf-8').send(
+    `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>`
+    + `<title>马老师社区 - 最新帖子</title><link>${base}</link><description>马老师社区最新主题订阅</description>`
+    + `<language>zh-CN</language>${items}</channel></rss>`);
+});
+/* 🗺️ sitemap.xml：搜索引擎收录（只收录游客可见的 LV1 帖，1 小时缓存） */
+let sitemapCache = { at: 0, xml: '' };
+app.get('/sitemap.xml', (req, res) => {
+  if (Date.now() - sitemapCache.at < 3600000 && sitemapCache.xml) {
+    return res.type('application/xml; charset=utf-8').send(sitemapCache.xml);
+  }
+  const db = loadDb();
+  const base = 'https://bbs.8818618.xyz';
+  const xmlEsc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const urls = [
+    `<url><loc>${base}/</loc><changefreq>hourly</changefreq><priority>1.0</priority></url>`,
+    `<url><loc>${base}/boards</loc><changefreq>hourly</changefreq><priority>0.8</priority></url>`,
+    `<url><loc>${base}/trends</loc><changefreq>daily</changefreq><priority>0.7</priority></url>`,
+    `<url><loc>${base}/guide</loc><changefreq>weekly</changefreq><priority>0.6</priority></url>`,
+    `<url><loc>${base}/lucky</loc><changefreq>daily</changefreq><priority>0.5</priority></url>`,
+  ];
+  db.topics.slice().sort((a, b) => new Date(b.bumpedAt || b.createdAt) - new Date(a.bumpedAt || a.createdAt))
+    .slice(0, 2000)
+    .filter(t => (t.minLevel || 1) <= 1 && !t.deleted)
+    .forEach(t => {
+      const lastmod = new Date(t.bumpedAt || t.createdAt).toISOString().slice(0, 10);
+      urls.push(`<url><loc>${base}/post/${xmlEsc(t.slug || t.id)}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq><priority>0.6</priority></url>`);
+    });
+  sitemapCache = { at: Date.now(), xml: `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join('')}</urlset>` };
+  res.type('application/xml; charset=utf-8').send(sitemapCache.xml);
+});
+/* 🔥 24小时热文榜（虎扑式）：24h 内有更新的帖子按热度排序 */
+app.get('/api/hot24', (req, res) => {
+  const db = loadDb();
+  const days = Math.max(1, Math.min(30, parseInt(req.query.days) || 1));
+  const since = Date.now() - days * 24 * 3600000;
+  const hot = db.topics
+    .filter(t => (!t.status || t.status === 'published') && new Date(t.bumpedAt || t.createdAt).getTime() > since)
+    .map(t => ({ t, score: (t.likeCount || 0) * 3 + (t.replyCount || 0) * 2 + (t.viewCount || 0) * 0.1 + (t.favoriteCount || 0) * 2 }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 30)
+    .map(({ t }) => ({ id: t.id, slug: t.slug, title: t.title, prefix: t.prefix || '', replyCount: t.replyCount, likeCount: t.likeCount || 0, viewCount: t.viewCount || 0, boardName: (boardById(db, t.boardId) || {}).name || '', boardColor: (boardById(db, t.boardId) || {}).color || '#999', bumpedAt: t.bumpedAt }));
+  res.json({ list: hot, days });
+});
 app.get('/api/topics', (req, res) => {
   const db = loadDb();
   let topics = db.topics.slice();
-  const { board, sort, tag, mine } = req.query;
+  /* 待审核/已拒绝的帖子只对作者本人和管理员可见 */
+  topics = topics.filter(t => !t.status || t.status === 'published' || (req.user && (t.userId === req.user.id || STAFF_ROLES.includes(req.user.role))));
+  const { board, sort, tag, mine, following } = req.query;
+  if (following) {
+    if (!req.user) topics = [];
+    else { const f = new Set(req.user.following || []); topics = topics.filter(t => f.has(t.userId)); }
+  }
   if (board) { const b = boardBySlug(db, board); if (b) topics = topics.filter(t => t.boardId === b.id); }
   if (tag) topics = topics.filter(t => (t.tags || []).includes(tag));
+  if (req.query.recommended) topics = topics.filter(t => t.recommended);
   if (mine && req.user) topics = topics.filter(t => t.userId === req.user.id);
   if (sort === 'hot') topics.sort((a, b) => (b.viewCount + b.replyCount * 5) - (a.viewCount + a.replyCount * 5));
   else if (sort === 'views') topics.sort((a, b) => b.viewCount - a.viewCount);
+  else if (sort === 'new') topics.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   else topics.sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt));
   topics.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
   /* 分页：默认每页 30 条，首页/分类/标签/我的共用 */
@@ -549,6 +795,15 @@ app.get('/api/topics/:id', (req, res) => {
   const db = loadDb();
   const topic = db.topics.find(t => t.id === req.params.id || t.slug === req.params.id);
   if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  if (topic.status && topic.status !== 'published' && !(req.user && (topic.userId === req.user.id || STAFF_ROLES.includes(req.user.role)))) {
+    return res.status(404).json({ error: '帖子不存在或待审核' });
+  }
+  /* 阅读等级门槛：LV1 = 所有人可见（含游客）；LV2+ 才需要对应等级 */
+  const need = Math.max(1, topic.minLevel || 1);
+  const viewerLv = req.user ? userLevel(req.user).level : 0;
+  if (need > 1 && viewerLv < need) {
+    return res.status(403).json({ error: `该帖子需要 LV${need} 及以上才能查看`, needLevel: need, myLevel: viewerLv });
+  }
   topic.viewCount += 1;
   saveDb(db);
   const enriched = enrichTopic(topic, db, { withPosts: true, userId: req.user && req.user.id });
@@ -556,12 +811,15 @@ app.get('/api/topics/:id', (req, res) => {
   res.json(enriched);
 });
 
-app.post('/api/topics', requireAuth, (req, res) => {
-  const { title, content, boardId, tags = [], price, poll, bounty } = req.body || {};
+app.post('/api/topics', requireAuth, rlTopic, (req, res) => {
+  const { title, content, boardId, tags = [], price, poll, bounty, prefix, minLevel, anonymous } = req.body || {};
   if (!title || !content || !boardId) return res.status(400).json({ error: '缺少标题、内容或板块' });
   const db = loadDb();
   const board = boardById(db, boardId);
   if (!board) return res.status(404).json({ error: '板块不存在' });
+  /* 电报树洞：普通用户投稿先进待审核（管理员/站长直发），可匿名；审核通过后同步电报频道 */
+  const isReviewBoard = board.slug === 'tg-treehole';
+  const needsReview = isReviewBoard && !STAFF_ROLES.includes(req.user.role);
   const topicId = id('tp');
   const time = nowIso();
   /* 悬赏：发帖时从自己鸡腿扣除悬赏金冻结，采纳回复后转给答主 */
@@ -581,15 +839,20 @@ app.post('/api/topics', requireAuth, (req, res) => {
     };
     unlockAch(db, req.user.id, 'poll');
   }
+  /* 阅读权限：LV1=所有人可见（默认），LV2-LV10=对应等级及以上可看 */
+  const ml = Math.max(1, Math.min(10, Math.floor(Number(minLevel) || 1)));
   const topic = {
     id: topicId, title, slug: slugify(title), boardId: board.id, userId: req.user.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: Array.isArray(tags) ? tags.slice(0, 5) : [], posts: [{ id: id('p'), topicId, userId: req.user.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
-    pinned: false, recommended: false, price: Number(price) || 0, closed: false,
+    pinned: false, recommended: false, price: Number(price) || 0, closed: false, minLevel: ml,
     poll: pollObj, bounty: bountyAmount, bestReplyId: null,
+    prefix: String(prefix || '').slice(0, 8),
+    status: needsReview ? 'pending' : 'published',
+    anonymous: isReviewBoard && !!anonymous,
   };
   db.topics.push(topic);
-  board.topicCount += 1;
+  if (!needsReview) board.topicCount += 1;
   addExp(db, req.user, 5);
   unlockAch(db, req.user.id, 'first-topic');
   checkCumulativeAch(db, req.user);
@@ -598,17 +861,71 @@ app.post('/api/topics', requireAuth, (req, res) => {
     if ((u.preferences && u.preferences.notifyMention) !== false) addNotification(db, u.id, 'mention', { topicId: topic.id, topicTitle: topic.title, fromId: req.user.id, fromName: req.user.name || req.user.username, content: content.slice(0, 80) });
   });
   saveDb(db);
-  notify.notifyAll(db, 'newTopic', { topicId: topic.id, title: topic.title, board: board.name, username: req.user.username, name: req.user.name || req.user.username }).catch(() => {});
+  if (!needsReview) notify.notifyAll(db, 'newTopic', { topicId: topic.id, title: topic.title, board: board.name, username: req.user.username, name: req.user.name || req.user.username }).catch(() => {});
   res.status(201).json(enrichTopic(topic, db));
 });
 
-app.post('/api/topics/:id/replies', requireAuth, (req, res) => {
+/* 聊天动态同步：聊天站发动态时自动在「聊天动态」板块开帖（共享密钥鉴权，密钥走环境变量 CHAT_SYNC_SECRET） */
+app.post('/api/integrations/moments', async (req, res) => {
+  const secret = process.env.CHAT_SYNC_SECRET || '';
+  if (!secret) return res.status(503).json({ error: '同步未启用' });
+  if (String(req.headers['x-sync-secret'] || '') !== secret) return res.status(401).json({ error: '密钥不正确' });
+  const { authorName, content, imageUrl, boardSlug } = req.body || {};
+  const text = String(content || '').trim().slice(0, 2000);
+  if (!text) return res.status(400).json({ error: '内容为空' });
+  const db = loadDb();
+  let board = null;
+  const wantedSlug = String(boardSlug || '').trim().slice(0, 60);
+  if (wantedSlug && wantedSlug !== 'moments') {
+    board = db.boards.find(b => b.slug === wantedSlug) || null;
+  }
+  if (!board) {
+    board = db.boards.find(b => b.slug === 'moments');
+  }
+  if (!board) {
+    board = { id: id('b'), name: '聊天动态', slug: 'moments', color: '#2fa39b', description: '马老师专属聊天里发布的动态，自动同步到这里', topicCount: 0 };
+    db.boards.push(board);
+  }
+  let bot = db.users.find(u => u.username === 'momentsbot');
+  if (!bot) {
+    bot = { id: id('u'), username: 'momentsbot', email: 'momentsbot@localhost', name: '聊天动态同步', passwordHash: hashPw('sync-' + Math.random().toString(36).slice(2)), avatar: null, createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0, checkinCoins: 0, lastCheckin: '', favorites: [], banned: false, ...defaultProfile() };
+    db.users.push(bot);
+  }
+  const time = nowIso();
+  const author = String(authorName || '聊天用户').slice(0, 30);
+  const title = text.replace(/\s+/g, ' ').slice(0, 28) || '一条动态';
+  const body = `【来自「马老师专属聊天」的动态】作者：${author}\n\n${text}${imageUrl ? `\n\n![](${String(imageUrl).slice(0, 500)})` : ''}`;
+  const topic = {
+    id: id('tp'), title, slug: slugify(title), boardId: board.id, userId: bot.id,
+    createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+    tags: ['聊天动态'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
+    poll: null, bounty: 0, bestReplyId: null, prefix: '',
+  };
+  topic.posts.push({ id: id('p'), topicId: topic.id, userId: bot.id, content: body, createdAt: time, likeCount: 0, postNumber: 1 });
+  db.topics.push(topic);
+  board.topicCount += 1;
+  saveDb(db);
+  await flushNow();
+  res.status(201).json({ ok: true, topicId: topic.id });
+});
+
+app.post('/api/topics/:id/replies', requireAuth, rlReply, (req, res) => {
   const { content } = req.body || {};
   if (!content) return res.status(400).json({ error: '回复内容不能为空' });
   const db = loadDb();
   const topic = db.topics.find(t => t.id === req.params.id || t.slug === req.params.id);
   if (!topic) return res.status(404).json({ error: '帖子不存在' });
   if (topic.closed) return res.status(403).json({ error: '帖子已关闭' });
+  /* 慢速模式：限制每人回帖间隔（版主/管理员不受限） */
+  const slowSec = topic.slowMode || 0;
+  if (slowSec > 0 && !isStaff(req.user)) {
+    const myPosts = topic.posts.filter(x => x.userId === req.user.id);
+    const last = myPosts.length ? myPosts[myPosts.length - 1] : null;
+    if (last) {
+      const waitMs = slowSec * 1000 - (Date.now() - new Date(last.createdAt).getTime());
+      if (waitMs > 0) return res.status(429).json({ error: `慢速模式：请 ${Math.ceil(waitMs / 1000)} 秒后再回复`, retryAfter: Math.ceil(waitMs / 1000) });
+    }
+  }
   const time = nowIso();
   const post = { id: id('p'), topicId: topic.id, userId: req.user.id, content, createdAt: time, likeCount: 0, postNumber: topic.posts.length + 1 };
   topic.posts.push(post);
@@ -812,6 +1129,127 @@ function migrateCompanyReviews(db) {
 }
 
 /* ================= 公司避雷库（公开） ================= */
+/* ---- 远程公司库代理模式 ----
+ * 1.86GB 的 SQLite 全库（585 万家）无法塞进 Vercel Serverless（250MB 上限）。
+ * 在一台常驻机器上跑 companies-api/companies-api.js，然后设环境变量：
+ *   COMPANIES_API_URL=https://公司库机器:3457  [COMPANIES_API_KEY=xxx]
+ * 论坛的公司搜索/详情/meta/统计即走远程全库；未设置时走原有逻辑（本地 SQLite → 静态名录）。
+ * 评价数据仍存论坛主库（KV/db.json），远程只提供只读名录。 */
+const COMPANIES_API_URL = (process.env.COMPANIES_API_URL || '').replace(/\/+$/, '');
+const COMPANIES_API_KEY = process.env.COMPANIES_API_KEY || '';
+const _remoteCompanyCache = new Map(); /* id/name -> 行，进程级缓存 */
+async function companiesApi(path, timeoutMs = 12000) {
+  if (!COMPANIES_API_URL) return null;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(COMPANIES_API_URL + path, {
+      headers: COMPANIES_API_KEY ? { 'x-api-key': COMPANIES_API_KEY } : {},
+      signal: ctl.signal,
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) { return null; } finally { clearTimeout(t); }
+}
+function _cacheRemoteRow(r) {
+  if (!r || !r.id) return;
+  _remoteCompanyCache.set(String(r.id), r);
+  if (r.name) _remoteCompanyCache.set(r.name, r);
+  if (_remoteCompanyCache.size > 4000) _remoteCompanyCache.delete(_remoteCompanyCache.keys().next().value);
+}
+async function ensureRemoteCompany(idOrName) {
+  if (!COMPANIES_API_URL || idOrName === undefined || idOrName === null) return null;
+  const key = String(idOrName);
+  if (_remoteCompanyCache.has(key)) return _remoteCompanyCache.get(key);
+  const r = await companiesApi('/companies/' + encodeURIComponent(key));
+  if (r && r.id) { _cacheRemoteRow(r); return r; }
+  return null;
+}
+async function ensureRemoteCompanies(ids) {
+  if (!COMPANIES_API_URL || !ids.length) return;
+  const miss = [...new Set(ids.map(String))].filter(k => /^\d+$/.test(k) && !_remoteCompanyCache.has(k)).slice(0, 500);
+  if (!miss.length) return;
+  const rows = await companiesApi('/companies/batch?ids=' + miss.join(','));
+  (rows || []).forEach(_cacheRemoteRow);
+}
+/* 远程行 + 本地评价 → 完整视图 */
+function remoteCompanyView(db, r) {
+  const rv = (db.companyReviews || {})[String(r.id)];
+  if (!rv || !rv.length) return { ...r, reviewCount: 0, avg: 0, level: 'pending', label: '待评价' };
+  const sorted = rv.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const { level, label, avg } = companyLevel(rv);
+  return { ...r, reviewCount: rv.length, avg, level, label, reviews: sorted };
+}
+/* 远程列表查询（含评价排序的两段式逻辑，与 SQLite 版一致） */
+async function remoteListCompanies(db, { q, province, city, industry, tag, sort, page, pageSize }) {
+  if (!COMPANIES_API_URL) return null;
+  const reviewedIds = Object.keys(db.companyReviews || {}).filter(k => /^\d+$/.test(k));
+  const toParams = (extra) => new URLSearchParams({
+    q: q || '', province: province || '', city: city || '', industry: industry || '',
+    tag: tag || '', sort: sort || '', page: String(page), pageSize: String(pageSize), ...extra,
+  }).toString();
+  if (['rating', 'reviews', 'danger'].includes(sort) && reviewedIds.length) {
+    const rows = await companiesApi('/companies/batch?ids=' + reviewedIds.slice(0, 500).join(','));
+    if (rows) {
+      rows.forEach(_cacheRemoteRow);
+      const qs = String(q || '').trim().toLowerCase();
+      let list = rows.filter(r =>
+        (!qs || String(r.name).toLowerCase().includes(qs)) &&
+        (!province || r.province === province) &&
+        (!city || r.city === city) &&
+        (!industry || r.industry === industry) &&
+        (!tag || (r.tags || []).includes(tag))
+      ).map(r => remoteCompanyView(db, r));
+      if (sort === 'rating') list.sort((a, b) => b.avg - a.avg || b.reviewCount - a.reviewCount);
+      else if (sort === 'reviews') list.sort((a, b) => b.reviewCount - a.reviewCount);
+      else list.sort((a, b) => (b.avg >= 4 ? 1 : 0) - (a.avg >= 4 ? 1 : 0) || b.avg - a.avg);
+      const total = list.length;
+      const pageStart = (page - 1) * pageSize;
+      const slice = list.slice(pageStart, pageStart + pageSize);
+      if (slice.length < pageSize && total >= pageStart) {
+        const need = pageSize - slice.length;
+        const fillPage = Math.floor(Math.max(0, pageStart - total) / need) + 1;
+        const more = await companiesApi('/companies?' + toParams({ page: String(fillPage), pageSize: String(need), excludeIds: reviewedIds.slice(0, 500).join(',') }));
+        (more && more.list || []).forEach(r => slice.push(remoteCompanyView(db, r)));
+      }
+      return { list: slice, total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)), via: 'companies-api' };
+    }
+  }
+  const r = await companiesApi('/companies?' + toParams({}));
+  if (!r) return null;
+  r.list = (r.list || []).map(x => remoteCompanyView(db, x));
+  /* 合并用户/管理员添加的公司（extraCompanies）：否则审核通过后在远程模式下永远显示不出来。
+   * 仅第 1 页置顶展示，命中筛选条件的才合并。 */
+  if (page === 1 && Array.isArray(db.extraCompanies) && db.extraCompanies.length) {
+    const qs = String(q || '').trim().toLowerCase();
+    const remoteNames = new Set(r.list.map(x => String(x.name)));
+    const matched = db.extraCompanies.filter(c => {
+      const name = String(c.name || '');
+      if (!name || remoteNames.has(name)) return false;
+      if (qs && !name.toLowerCase().includes(qs)) return false;
+      if (province && (c.province || c.region || '') !== province) return false;
+      if (city && String(c.city || '') !== String(city)) return false;
+      if (industry && (c.industry || '其他') !== industry) return false;
+      if (tag && !(c.tags || []).includes(tag)) return false;
+      return true;
+    }).map(c => {
+      const v = companyView(db, c);
+      return {
+        id: v.id, name: v.name, industry: v.industry,
+        province: c.province || c.region || '', city: c.city || '',
+        address: c.address || '', tags: c.tags || [], regYear: null,
+        reviewCount: v.reviewCount, avg: v.avg, level: v.level, label: v.label,
+        source: 'extra', note: v.note || '',
+      };
+    });
+    if (matched.length) {
+      r.list = matched.concat(r.list).slice(0, pageSize);
+      r.total = (r.total || 0) + matched.length;
+      r.pages = Math.max(1, Math.ceil(r.total / pageSize));
+    }
+  }
+  return r;
+}
 /* 避雷指数：avg 为该司所有评价星级均值（1-5），level 分级：
  *   pending 待评价 / ok 尚可(1-2) / careful 谨慎(2-3) / warn 避雷(3-4) / danger 强烈避雷(4-5) */
 const COMPANY_CATALOG_FILE = path.join(__dirname, 'public', 'data', 'companies.json');
@@ -934,6 +1372,10 @@ function findCompanyMeta(db, idOrName) {
   if (extra) return { hit: extra, inCatalog: false };
   const row = sqlFindCompany(idOrName);
   if (row) return { hit: sqlCompanyRow(row), inCatalog: true };
+  if (COMPANIES_API_URL) {
+    const cached = _remoteCompanyCache.get(String(idOrName));
+    if (cached) return { hit: cached, inCatalog: true };
+  }
   if (!catById) buildCatIndex();
   const hit = catById.get(idOrName) || catByName.get(idOrName);
   return { hit: hit || null, inCatalog: !!hit };
@@ -979,11 +1421,19 @@ function companyJson2(db, hit, opts = {}) {
   };
 }
 
-app.get('/api/companies', (req, res) => {
+app.get('/api/companies', async (req, res) => {
   const db = loadDb();
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 30));
   const { q, industry, region, city, tag, sort } = req.query;
+  /* 远程全库模式（companies-api）：585 万家 */
+  if (COMPANIES_API_URL && !hasNationalCatalog()) {
+    const remoteRes = await remoteListCompanies(db, { q, province: region || undefined, city, industry, tag, sort, page, pageSize });
+    if (remoteRes) {
+      remoteRes.list.forEach(c => { c.watched = req.user && (req.user.watchCompanies || []).includes(c.id); });
+      return res.json(remoteRes);
+    }
+  }
   /* 全国模式（SQLite）：重庆省份第一呈现 */
   const sqlRes = sqlListCompanies(db, { q, province: region || undefined, city, industry, tag, sort, page, pageSize });
   if (sqlRes) {
@@ -1012,8 +1462,12 @@ app.get('/api/companies', (req, res) => {
   res.json({ list: rows, total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)), via: 'static' });
 });
 
-app.get('/api/companies/meta/industries', (req, res) => {
+app.get('/api/companies/meta/industries', async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) {
+    const r = await companiesApi('/meta/industries');
+    if (r) return res.json(r);
+  }
   const s = sqlMetaIndustries();
   if (s) return res.json(s);
   const extraLen = (db.extraCompanies || []).length;
@@ -1028,31 +1482,46 @@ app.get('/api/companies/meta/industries', (req, res) => {
 });
 
 /* 省份 / 风险标签 / 数据看板（全国模式） */
-app.get('/api/companies/meta/provinces', (req, res) => {
+app.get('/api/companies/meta/provinces', async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) {
+    const r = await companiesApi('/meta/provinces');
+    if (r) return res.json(r);
+  }
   const s = sqlMetaProvinces();
   if (s) return res.json(s);
   res.json([]);
 });
-app.get('/api/companies/meta/tags', (req, res) => {
+app.get('/api/companies/meta/tags', async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) {
+    const r = await companiesApi('/meta/tags');
+    if (r) return res.json(r);
+  }
   const s = sqlMetaTags();
   if (s) return res.json(s);
   res.json([]);
 });
-app.get('/api/companies/stats', (req, res) => {
+app.get('/api/companies/stats', async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) {
+    const r = await companiesApi('/stats');
+    if (r) return res.json({ ok: true, ...r });
+  }
   const s = sqlStats();
   if (s) return res.json({ ok: true, ...s });
   res.json({ ok: true, total: loadCompanyCatalog().length, provinces: 1, industries: 0, years: { min: 0, max: 0 }, chongqing: loadCompanyCatalog().filter(c => (c.region || '').includes('重庆') || c.region === '渝').length });
 });
 
 /* 避雷热榜：全国 / 按省份；红黑榜 */
-app.get('/api/companies/hot', (req, res) => {
+app.get('/api/companies/hot', async (req, res) => {
   const db = loadDb();
   const province = req.query.province || '';
   const type = req.query.type || 'danger'; // danger=强烈避雷榜 / reviews=热议榜 / red=红榜(口碑好)
   const reviews = db.companyReviews || {};
+  if (COMPANIES_API_URL && !hasNationalCatalog()) {
+    await ensureRemoteCompanies(Object.keys(reviews));
+  }
   const arr = [];
   for (const [cid, rlist] of Object.entries(reviews)) {
     if (!rlist || !rlist.length) continue;
@@ -1069,7 +1538,7 @@ app.get('/api/companies/hot', (req, res) => {
 });
 
 /* 访客自主添加避雷公司（登录用户即可提交，进入待审核队列） */
-app.post('/api/companies/submit', requireAuth, (req, res) => {
+app.post('/api/companies/submit', requireAuth, async (req, res) => {
   const db = loadDb();
   const name = String((req.body && req.body.name) || '').trim();
   if (name.length < 2) return res.status(400).json({ error: '公司名称至少 2 个字' });
@@ -1080,6 +1549,7 @@ app.post('/api/companies/submit', requireAuth, (req, res) => {
   const address = String((req.body && req.body.address) || '').trim().slice(0, 200);
   const note = String((req.body && req.body.note) || '').trim().slice(0, 500);
   /* 去重：已在全国库或 extraCompanies 或 pendingCompanies 中则提示 */
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(name);
   const existMeta = findCompanyMeta(db, name);
   if (existMeta && existMeta.hit) return res.status(409).json({ error: '该公司已存在于避雷库中' });
   if ((db.extraCompanies || []).some(c => c.name === name)) return res.status(409).json({ error: '该公司已存在' });
@@ -1107,17 +1577,19 @@ app.get('/api/companies/pending', (req, res) => {
   res.json(list);
 });
 
-app.get('/api/companies/:id', (req, res) => {
+app.get('/api/companies/:id', async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(req.params.id);
   const { hit } = findCompanyMeta(db, req.params.id);
   if (!hit) return res.status(404).json({ error: '公司不存在' });
   const j = companyJson2(db, hit, { withReviews: true, userId: req.user ? req.user.id : null, watched: req.user ? (req.user.watchCompanies || []) : [] });
   res.json(j);
 });
 
-/* 评价：支持匿名 + 点赞/踩；未登录访客也可评价（带昵称） */
-app.post('/api/companies/:id/reviews', (req, res) => {
+/* 评价：仅登录用户可写 */
+app.post('/api/companies/:id/reviews', requireAuth, async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(req.params.id);
   const { hit } = findCompanyMeta(db, req.params.id);
   if (!hit) return res.status(404).json({ error: '公司不存在' });
   const rating = Number((req.body && req.body.rating));
@@ -1126,32 +1598,26 @@ app.post('/api/companies/:id/reviews', (req, res) => {
   if (!content) return res.status(400).json({ error: '请写一句避雷理由' });
   db.companyReviews = db.companyReviews || {};
   const reviews = db.companyReviews[hit.id] || (db.companyReviews[hit.id] = []);
-  const isAnon = !req.user || !!req.body.anonymous;
-  const nick = isAnon ? (String((req.body && req.body.nickname) || '').trim().slice(0, 20) || '匿名访客') : (req.user.name || req.user.username);
-  if (req.user) {
-    const mine = reviews.find(r => r.userId === req.user.id);
-    if (mine) { mine.rating = rating; mine.content = content; mine.anonymous = isAnon; mine.nickname = isAnon ? nick : null; mine.createdAt = nowIso(); saveDb(db); return res.json(companyJson2(db, hit, { withReviews: true, userId: req.user.id, watched: req.user.watchCompanies || [] })); }
-  } else {
-    /* 访客匿名评价：按昵称+IP 防刷（同一公司同一昵称 10 分钟内只能评一次） */
-    const guestKey = nick + '|' + (req.ip || 'unknown');
-    const recent = reviews.find(r => r.guestKey === guestKey && (Date.now() - new Date(r.createdAt).getTime()) < 600000);
-    if (recent) return res.status(429).json({ error: '评价太频繁，请 10 分钟后再试' });
-  }
+  const isAnon = !!req.body.anonymous;
+  const nick = isAnon ? (String((req.body && req.body.nickname) || '').trim().slice(0, 20) || '匿名') : (req.user.name || req.user.username);
+  const mine = reviews.find(r => r.userId === req.user.id);
+  if (mine) { mine.rating = rating; mine.content = content; mine.anonymous = isAnon; mine.nickname = isAnon ? nick : null; mine.createdAt = nowIso(); saveDb(db); return res.json(companyJson2(db, hit, { withReviews: true, userId: req.user.id, watched: req.user.watchCompanies || [] })); }
   const review = {
-    id: id('rv'), userId: req.user ? req.user.id : null, username: req.user ? req.user.username : null,
-    name: nick, avatar: req.user && !isAnon ? req.user.avatar : null, rating, content,
-    anonymous: isAnon, nickname: isAnon ? nick : null, guestKey: req.user ? null : (nick + '|' + (req.ip || 'unknown')),
+    id: id('rv'), userId: req.user.id, username: req.user.username,
+    name: nick, avatar: !isAnon ? req.user.avatar : null, rating, content,
+    anonymous: isAnon, nickname: isAnon ? nick : null, guestKey: null,
     votes: { up: [], down: [] }, createdAt: nowIso(),
   };
   reviews.push(review);
-  if (req.user) { addExp(db, req.user, 3); unlockAch(db, req.user.id, 'company-review'); checkCumulativeAch(db, req.user); }
+  addExp(db, req.user, 3); unlockAch(db, req.user.id, 'company-review'); checkCumulativeAch(db, req.user);
   saveDb(db);
-  res.json(companyJson2(db, hit, { withReviews: true, userId: req.user ? req.user.id : null, watched: req.user ? (req.user.watchCompanies || []) : [] }));
+  res.json(companyJson2(db, hit, { withReviews: true, userId: req.user.id, watched: req.user.watchCompanies || [] }));
 });
 
 /* 评价点赞/踩 */
-app.post('/api/companies/:id/reviews/:rid/vote', requireAuth, (req, res) => {
+app.post('/api/companies/:id/reviews/:rid/vote', requireAuth, async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(req.params.id);
   const { hit } = findCompanyMeta(db, req.params.id);
   if (!hit) return res.status(404).json({ error: '公司不存在' });
   const review = ((db.companyReviews || {})[hit.id] || []).find(r => r.id === req.params.rid);
@@ -1206,8 +1672,52 @@ app.post('/api/topics/:id/like', requireAuth, (req, res) => {
     const author = db.users.find(u => u.id === topic.userId);
     if (author) addExp(db, author, 1);
   }
+  /* 赞踩互斥：点赞则取消之前的踩 */
+  if (liked) {
+    const dislikedUsers = topic.dislikedUsers || [];
+    const di = dislikedUsers.indexOf(req.user.id);
+    if (di >= 0) { dislikedUsers.splice(di, 1); topic.dislikeCount = Math.max(0, (topic.dislikeCount || 0) - 1); }
+  }
   saveDb(db);
-  res.json({ liked, likeCount: topic.likeCount });
+  res.json({ liked, likeCount: topic.likeCount, disliked: (topic.dislikedUsers || []).includes(req.user.id), dislikeCount: topic.dislikeCount || 0 });
+});
+
+/* 表情回应：切换某 emoji，返回全量统计 */
+const REACT_EMOJIS = ['❤️', '😂', '😮', '😢', '👏', '🔥'];
+app.post('/api/topics/:id/react', requireAuth, (req, res) => {
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === req.params.id || t.slug === req.params.id);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  const emoji = String((req.body || {}).emoji || '');
+  if (!REACT_EMOJIS.includes(emoji)) return res.status(400).json({ error: '不支持的表情' });
+  topic.reactions = topic.reactions || {};
+  const arr = topic.reactions[emoji] || (topic.reactions[emoji] = []);
+  const i = arr.indexOf(req.user.id);
+  let on;
+  if (i >= 0) { arr.splice(i, 1); on = false; } else { arr.push(req.user.id); on = true; }
+  saveDb(db);
+  const stats = {};
+  for (const e of REACT_EMOJIS) stats[e] = { count: (topic.reactions[e] || []).length, mine: (topic.reactions[e] || []).includes(req.user.id) };
+  res.json({ on, emoji, stats });
+});
+
+app.post('/api/topics/:id/dislike', requireAuth, (req, res) => {
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === req.params.id || t.slug === req.params.id);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  const dislikedUsers = topic.dislikedUsers || (topic.dislikedUsers = []);
+  const idx = dislikedUsers.indexOf(req.user.id);
+  let disliked;
+  if (idx >= 0) { dislikedUsers.splice(idx, 1); disliked = false; topic.dislikeCount = Math.max(0, (topic.dislikeCount || 0) - 1); }
+  else {
+    dislikedUsers.push(req.user.id); disliked = true; topic.dislikeCount = (topic.dislikeCount || 0) + 1;
+    /* 赞踩互斥：踩则取消之前的赞 */
+    const likedUsers = topic.likedUsers || [];
+    const li = likedUsers.indexOf(req.user.id);
+    if (li >= 0) { likedUsers.splice(li, 1); topic.likeCount = Math.max(0, topic.likeCount - 1); }
+  }
+  saveDb(db);
+  res.json({ disliked, dislikeCount: topic.dislikeCount || 0, liked: (topic.likedUsers || []).includes(req.user.id), likeCount: topic.likeCount });
 });
 
 app.post('/api/topics/:id/favorite', requireAuth, (req, res) => {
@@ -1225,11 +1735,26 @@ app.post('/api/topics/:id/favorite', requireAuth, (req, res) => {
   res.json({ favorited, favoriteCount: topic.favoriteCount });
 });
 
+/* 书签提醒：设置/取消某收藏的提醒时间 */
+app.post('/api/topics/:id/reminder', requireAuth, (req, res) => {
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === req.params.id || t.slug === req.params.id);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  const at = (req.body || {}).at ? new Date((req.body || {}).at).toISOString() : null;
+  if (at && new Date(at).getTime() <= Date.now()) return res.status(400).json({ error: '提醒时间必须是未来时间' });
+  req.user.favReminders = req.user.favReminders || {};
+  if (at) req.user.favReminders[topic.id] = at;
+  else delete req.user.favReminders[topic.id];
+  saveDb(db);
+  res.json({ ok: true, reminderAt: at });
+});
+
 app.get('/api/favorites', requireAuth, (req, res) => {
   const db = loadDb();
   const ids = req.user.favorites || [];
   const list = db.topics.filter(t => ids.includes(t.id)).sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt));
-  res.json(list.map(t => enrichTopic(t, db)));
+  const rems = req.user.favReminders || {};
+  res.json(list.map(t => ({ ...enrichTopic(t, db), reminderAt: rems[t.id] || null })));
 });
 
 /* ================= 帖子编辑 / 删除（作者或管理员） ================= */
@@ -1240,13 +1765,14 @@ app.put('/api/topics/:id', requireAuth, (req, res) => {
   const isAuthor = topic.userId === req.user.id;
   const isStaff = ['admin', 'owner'].includes(req.user.role);
   if (!isAuthor && !isStaff) return res.status(403).json({ error: '只有作者或管理员可以编辑' });
-  const { title, content, tags, boardId } = req.body || {};
+  const { title, content, tags, boardId, minLevel } = req.body || {};
   if (isAuthor || isStaff) {
     if (title !== undefined) {
       const t = String(title).trim().slice(0, 80);
       if (!t) return res.status(400).json({ error: '标题不能为空' });
       topic.title = t;
     }
+    if (minLevel !== undefined) topic.minLevel = Math.max(1, Math.min(10, Math.floor(Number(minLevel) || 1)));
     if (boardId) { const b = boardById(db, boardId); if (b) topic.boardId = b.id; }
     if (Array.isArray(tags)) topic.tags = tags.slice(0, 5);
   }
@@ -1254,6 +1780,9 @@ app.put('/api/topics/:id', requireAuth, (req, res) => {
     const t = String(content).trim();
     if (!t) return res.status(400).json({ error: '内容不能为空' });
     topic.posts[0].content = t;
+    /* 编辑记录公示 */
+    topic.posts[0].editedAt = nowIso();
+    topic.posts[0].editedBy = req.user.username;
   }
   topic.slug = slugify(topic.title);
   saveDb(db);
@@ -1323,6 +1852,18 @@ app.post('/api/messages', requireAuth, (req, res) => {
 /* ================= 站内通知 ================= */
 app.get('/api/notifications', requireAuth, (req, res) => {
   const db = loadDb();
+  /* 到期的书签提醒转成通知 */
+  const rems = req.user.favReminders || {};
+  let remChanged = false;
+  for (const [tid, at] of Object.entries(rems)) {
+    if (new Date(at).getTime() <= Date.now()) {
+      const topic = db.topics.find(t => t.id === tid);
+      if (topic) addNotification(db, req.user.id, 'reminder', { topicId: topic.id, title: topic.title, link: '/post/' + topic.slug });
+      delete rems[tid];
+      remChanged = true;
+    }
+  }
+  if (remChanged) saveDb(db);
   const list = db.notifications.filter(n => n.userId === req.user.id).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50);
   res.json(list.map(n => {
     const from = db.users.find(u => u.id === n.fromId);
@@ -1375,7 +1916,7 @@ app.get('/api/rank/active', (req, res) => {
   }));
   const list = db.users.filter(u => u.id !== GHOST.id).map(u => {
     const s = score[u.id] || { posts: 0, replies: 0 };
-    return { username: u.username, name: u.name, avatar: u.avatar, posts: s.posts, replies: s.replies, total: s.posts + s.replies, coins: u.coins || 0 };
+    return { id: u.id, username: u.username, name: u.name, avatar: u.avatar, posts: s.posts, replies: s.replies, total: s.posts + s.replies, coins: u.coins || 0 };
   }).filter(u => u.total > 0).sort((a, b) => b.total - a.total || b.coins - a.coins).slice(0, 50);
   res.json(list);
 });
@@ -1384,8 +1925,15 @@ app.get('/api/rank/active', (req, res) => {
 app.get('/api/tag/:name', (req, res) => {
   const db = loadDb();
   const name = decodeURIComponent(req.params.name);
-  const list = db.topics.filter(t => (t.tags || []).includes(name)).sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt));
-  res.json(list.map(t => enrichTopic(t, db)));
+  /* 服务端分页：标签下帖子可达上千篇，一次全返 2.5MB，手机端卡顿（2026-10-04 升级） */
+  const all = db.topics
+    .filter(t => (t.tags || []).includes(name) && (!t.status || t.status === 'published'))
+    .sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt));
+  const pageSize = Math.min(50, Math.max(1, parseInt(req.query.pageSize || '30', 10) || 30));
+  const pages = Math.max(1, Math.ceil(all.length / pageSize));
+  const page = Math.min(pages, Math.max(1, parseInt(req.query.page || '1', 10) || 1));
+  const list = all.slice((page - 1) * pageSize, page * pageSize).map(t => enrichTopic(t, db));
+  res.json({ total: all.length, page, pages, list });
 });
 
 /* ================= v8 玩法升级：等级 / 成就 / 商城 / 打赏悬赏 / 投票 / 交易 ================= */
@@ -1527,6 +2075,9 @@ app.post('/api/shop/buy', requireAuth, (req, res) => {
   } else if (item.type === 'title') {
     titleText = item.value === '__CUSTOM__' ? String((req.body && req.body.customTitle) || '').trim().slice(0, 12) : item.value;
     if (item.value === '__CUSTOM__' && !titleText) return res.status(400).json({ error: '请填写自定义头衔' });
+    /* 头衔进库存，可随时切换佩戴 */
+    req.user.titles = req.user.titles || [];
+    if (!req.user.titles.includes(titleText)) req.user.titles.push(titleText);
     req.user.title = titleText;
     req.user.titleExpireAt = item.value === '__CUSTOM__' ? new Date(Date.now() + 7 * 86400000).toISOString() : null;
   }
@@ -1535,6 +2086,25 @@ app.post('/api/shop/buy', requireAuth, (req, res) => {
   unlockAch(db, req.user.id, 'shop-buy');
   saveDb(db);
   res.json({ ok: true, coins: req.user.coins, title: req.user.title, badges: req.user.badges });
+});
+
+/* 切换佩戴头衔 */
+app.post('/api/shop/wear-title', requireAuth, (req, res) => {
+  const db = loadDb();
+  const t = String((req.body || {}).title || '').trim().slice(0, 12);
+  if (!t) return res.status(400).json({ error: '缺少头衔' });
+  const owned = req.user.titles || [];
+  if (!owned.includes(t) && req.user.title !== t) return res.status(403).json({ error: '你还没有这个头衔' });
+  req.user.title = t;
+  saveDb(db);
+  res.json({ ok: true, title: t });
+});
+/* 卸下头衔 */
+app.post('/api/shop/unwear-title', requireAuth, (req, res) => {
+  const db = loadDb();
+  req.user.title = '';
+  saveDb(db);
+  res.json({ ok: true });
 });
 
 /* 后台：商城商品管理 */
@@ -1675,6 +2245,18 @@ app.get('/api/search', (req, res) => {
 });
 
 /* ================= users ================= */
+/* 🌱 新用户墙（公开接口：只露用户名/头像/等级/注册时间，最近 30 人；须排在 /api/users/:id 之前） */
+app.get('/api/users/new', (req, res) => {
+  const db = loadDb();
+  const list = db.users
+    .filter(u => !u.banned)
+    .slice()
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, 30)
+    .map(u => { const lv = userLevel(u); return { username: u.username, name: u.name, avatar: u.avatar || null, level: lv.level, levelTitle: lv.levelTitle, createdAt: u.createdAt }; });
+  res.json({ list });
+});
+
 app.get('/api/users/:id', (req, res) => {
   const db = loadDb();
   const user = db.users.find(u => u.id === req.params.id || u.username === req.params.id);
@@ -1686,6 +2268,135 @@ app.get('/api/users/:id', (req, res) => {
   res.json({ ...userPublic(user), topicCount: topics.length, replyCount: replies, joinedAt: user.createdAt, followerCount, isFollowing, topics: topics.sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt)).map(t => enrichTopic(t, db)) });
 });
 
+/* 等级进度面板（linux.do 式：多维数据展示） */
+app.get('/api/users/:id/level-progress', (req, res) => {
+  const db = loadDb();
+  const user = db.users.find(u => u.id === req.params.id || u.username === req.params.id);
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+  const myTopics = db.topics.filter(t => t.userId === user.id);
+  const replies = db.topics.reduce((a, t) => a + t.posts.filter(p => p.userId === user.id && p.postNumber > 1).length, 0);
+  const likesReceived = myTopics.reduce((a, t) => a + (t.likeCount || 0), 0);
+  const favReceived = myTopics.reduce((a, t) => a + (t.favoriteCount || 0), 0);
+  const lv = userLevel(user);
+  const next = LEVELS.find(L => L.lv === lv.level + 1);
+  /* 各等级所需经验（供前端画全等级轴） */
+  res.json({
+    level: lv.level, levelTitle: lv.levelTitle, exp: lv.exp, nextExp: lv.nextExp, progress: lv.progress,
+    nextTitle: next ? next.title : null,
+    levels: LEVELS.map(L => ({ lv: L.lv, exp: L.exp, title: L.title })),
+    stats: [
+      { icon: '📝', label: '主题', value: myTopics.length },
+      { icon: '💬', label: '回复', value: replies },
+      { icon: '👍', label: '获赞', value: likesReceived },
+      { icon: '⭐', label: '被收藏', value: favReceived },
+      { icon: '📅', label: '签到天数', value: user.checkinCount || 0 },
+      { icon: '🍗', label: '鸡腿', value: user.coins || 0 },
+    ],
+  });
+});
+
+/* 用户小卡片（轻量，供 hover 展示） */
+app.get('/api/users/:id/card', (req, res) => {
+  const db = loadDb();
+  const user = db.users.find(u => u.id === req.params.id || u.username === req.params.id);
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+  const p = userPublic(user);
+  const topicCount = db.topics.filter(t => t.userId === user.id).length;
+  const replyCount = db.topics.reduce((a, t) => a + t.posts.filter(x => x.userId === user.id && x.postNumber > 1).length, 0);
+  const likeGot = db.topics.filter(t => t.userId === user.id).reduce((a, t) => a + (t.likeCount || 0), 0);
+  res.json({ username: p.username, name: p.name, avatar: p.avatar, role: p.role, level: p.level, levelTitle: p.levelTitle, coins: p.coins || 0, bio: p.bio || '', topicCount, replyCount, likeGot, joinedAt: user.createdAt });
+});
+
+/* ⚖️ 管理记录公示（公开可查） */
+app.get('/api/modlogs', (req, res) => {
+  const db = loadDb();
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const pageSize = 30;
+  const list = (db.modLogs || []).slice();
+  res.json({ total: list.length, page, pageSize, logs: list.slice((page - 1) * pageSize, page * pageSize) });
+});
+/* ---- 🎲 幸运抽奖（确定性算法，种子公开可复算） ---- */
+function seededRandom(seed) {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return function () {
+    h = Math.imul(h ^ (h >>> 15), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return ((h ^= h >>> 16) >>> 0) / 4294967296;
+  };
+}
+function tryLotteryDraw(db, lot, force) {
+  if (lot.status === 'drawn') return { ok: true };
+  const topic = db.topics.find(t => t.id === lot.topicId);
+  if (!topic) return { ok: false, error: '关联帖子不存在' };
+  const timeOk = lot.drawAt && Date.now() >= new Date(lot.drawAt).getTime();
+  const floorOk = lot.targetFloors && topic.replyCount >= lot.targetFloors;
+  if (!force && !timeOk && !floorOk) return { ok: false, error: '开奖条件未满足' };
+  const floors = [];
+  const seenUsers = new Set();
+  topic.posts.forEach(p => {
+    if (p.postNumber < lot.startFloor) return;
+    if (lot.dedupe) { if (seenUsers.has(p.userId)) return; seenUsers.add(p.userId); }
+    floors.push({ floor: p.postNumber, userId: p.userId });
+  });
+  if (!floors.length) return { ok: false, error: '暂无符合条件的楼层' };
+  const rand = seededRandom(lot.id + '|' + lot.topicId + '|' + lot.createdAt);
+  for (let i = floors.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); const tmp = floors[i]; floors[i] = floors[j]; floors[j] = tmp; }
+  lot.winners = floors.slice(0, Math.min(lot.prizeCount, floors.length)).map(f => {
+    const u = db.users.find(x => x.id === f.userId);
+    return { floor: f.floor, userId: f.userId, name: u ? u.name : '未知用户', username: u ? u.username : '' };
+  });
+  lot.status = 'drawn';
+  lot.drawnAt = nowIso();
+  lot.seedInfo = `种子=${lot.id}|${lot.topicId}|${lot.createdAt}（Fisher-Yates 洗牌，结果可复算验证）`;
+  return { ok: true };
+}
+app.post('/api/lottery', requireAuth, (req, res) => {
+  const db = loadDb();
+  const { topicId, title, prizeCount, startFloor, dedupe, drawAt, targetFloors } = req.body || {};
+  const topic = db.topics.find(t => t.id === topicId || t.slug === topicId);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  if (topic.userId !== req.user.id && !['admin', 'owner'].includes(req.user.role)) return res.status(403).json({ error: '只有楼主或管理员可以为该帖发起抽奖' });
+  const lot = {
+    id: id('lucky'), topicId: topic.id, topicTitle: topic.title,
+    title: String(title || '').trim().slice(0, 40) || '幸运抽奖',
+    prizeCount: Math.min(100, Math.max(1, parseInt(prizeCount) || 1)),
+    startFloor: Math.max(2, parseInt(startFloor) || 2),
+    dedupe: dedupe !== false,
+    drawAt: drawAt ? new Date(drawAt).toISOString() : null,
+    targetFloors: parseInt(targetFloors) || null,
+    status: 'pending', winners: [], drawnAt: null, seedInfo: '',
+    createdBy: req.user.id, createdByName: req.user.name, createdAt: nowIso(),
+  };
+  if (!lot.drawAt && !lot.targetFloors) return res.status(400).json({ error: '请设置开奖时间或目标楼层数' });
+  db.lotteries.unshift(lot);
+  saveDb(db);
+  res.json({ ok: true, lottery: lot });
+});
+app.get('/api/lottery', (req, res) => {
+  const db = loadDb();
+  res.json((db.lotteries || []).map(l => ({ ...l, topicSlug: ((db.topics.find(t => t.id === l.topicId)) || {}).slug || '' })));
+});
+app.get('/api/lottery/:id', (req, res) => {
+  const db = loadDb();
+  const lot = (db.lotteries || []).find(l => l.id === req.params.id);
+  if (!lot) return res.status(404).json({ error: '抽奖不存在' });
+  tryLotteryDraw(db, lot, false);
+  saveDb(db);
+  const topic = db.topics.find(t => t.id === lot.topicId);
+  res.json({ ...lot, topicSlug: topic ? (topic.slug || topic.id) : '', replyCount: topic ? topic.replyCount : 0 });
+});
+app.post('/api/lottery/:id/draw', requireAuth, (req, res) => {
+  const db = loadDb();
+  const lot = (db.lotteries || []).find(l => l.id === req.params.id);
+  if (!lot) return res.status(404).json({ error: '抽奖不存在' });
+  if (lot.createdBy !== req.user.id && !['admin', 'owner'].includes(req.user.role)) return res.status(403).json({ error: '只有发起人或管理员可以开奖' });
+  if (lot.status === 'drawn') return res.status(400).json({ error: '已开奖' });
+  const r = tryLotteryDraw(db, lot, true);
+  saveDb(db);
+  if (!r.ok) return res.status(400).json({ error: r.error });
+  res.json({ ok: true, lottery: lot });
+});
 /* 用户关注 / 取消关注 */
 app.post('/api/users/:id/follow', requireAuth, (req, res) => {
   const db = loadDb();
@@ -1748,6 +2459,1358 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
     owners: db.users.filter(u => u.role === 'owner').length,
     admins: db.users.filter(u => u.role === 'admin').length,
   });
+});
+
+/* 14 日趋势：每日新增用户 / 主题 / 回复 */
+app.get('/api/admin/stats/trend', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const days = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400000);
+    days.push(todayStr(d));
+  }
+  const trend = days.map(day => {
+    const newUsers = db.users.filter(u => u.id !== GHOST.id && u.createdAt && todayStr(new Date(u.createdAt)) === day).length;
+    const newTopics = db.topics.filter(t => t.createdAt && todayStr(new Date(t.createdAt)) === day).length;
+    let newReplies = 0;
+    db.topics.forEach(t => { (t.posts || []).forEach((p, idx) => { if (idx > 0 && p.createdAt && todayStr(new Date(p.createdAt)) === day) newReplies++; }); });
+    return { day: day.slice(5), newUsers, newTopics, newReplies };
+  });
+  res.json({ trend });
+});
+
+/* ================= admin: 全站公告 ================= */
+app.get('/api/admin/announcements', requireAdmin, (req, res) => {
+  res.json(loadDb().announcements || []);
+});
+app.post('/api/admin/announcements', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const { title, content, active } = req.body || {};
+  if (!title || !String(title).trim()) return res.status(400).json({ error: '公告标题必填' });
+  const a = { id: id('an'), title: String(title).slice(0, 60), content: String(content || '').slice(0, 500), active: active !== false, createdAt: nowIso(), createdBy: req.user.name };
+  db.announcements.unshift(a);
+  modLog(db, '发布公告', req.user, '', `《${a.title}》`);
+  saveDb(db);
+  res.status(201).json(a);
+});
+app.put('/api/admin/announcements/:id', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const a = (db.announcements || []).find(x => x.id === req.params.id);
+  if (!a) return res.status(404).json({ error: '公告不存在' });
+  const { title, content, active } = req.body || {};
+  if (title !== undefined) a.title = String(title).slice(0, 60);
+  if (content !== undefined) a.content = String(content || '').slice(0, 500);
+  if (active !== undefined) a.active = !!active;
+  saveDb(db);
+  res.json(a);
+});
+app.delete('/api/admin/announcements/:id', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const idx = (db.announcements || []).findIndex(x => x.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: '公告不存在' });
+  const [a] = db.announcements.splice(idx, 1);
+  modLog(db, '删除公告', req.user, '', `《${a.title}》`);
+  saveDb(db);
+  res.json({ ok: true });
+});
+/* 公开：生效中的公告（首页横幅） */
+app.get('/api/announcements', (req, res) => {
+  res.json((loadDb().announcements || []).filter(a => a.active).slice(0, 5));
+});
+
+/* ================= 📰 每日新闻自动播报（Vercel Cron 触发） ================= */
+/* 数据源：TrendRadar 同款 NewsNow 聚合 API（newsnow.busiyi.world），单接口覆盖全平台热榜 */
+const NEWS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+async function fetchJson(url, ms = 12000) {
+  const c = new AbortController(); const t = setTimeout(() => c.abort(), ms);
+  try { const r = await fetch(url, { headers: NEWS_UA, signal: c.signal }); return await r.json(); }
+  catch { return null; } finally { clearTimeout(t); }
+}
+/* NewsNow 平台源：id / 表情 / 名称 / 取条数 */
+const NEWS_SOURCES = [
+  { id: 'weibo', emoji: '🔥', name: '微博热搜', n: 10 },
+  { id: 'douyin', emoji: '🎬', name: '抖音热点', n: 10 },
+  { id: 'toutiao', emoji: '📰', name: '今日头条', n: 8 },
+  { id: 'hupu', emoji: '🏀', name: '虎扑热搜', n: 8 },
+  { id: 'zhihu', emoji: '💬', name: '知乎热榜', n: 8 },
+  { id: 'cls', emoji: '💰', name: '财经快讯', n: 8 },
+  { id: 'sspai', emoji: '💻', name: '科技前沿', n: 8 },
+];
+async function getNewsNow(id) {
+  const d = await fetchJson(`https://newsnow.busiyi.world/api/s?id=${id}&latest`);
+  if (!d || !['success', 'cache'].includes(d.status)) return [];
+  return (d.items || []).map(x => ({ title: String(x.title || '').trim(), url: x.url || x.mobileUrl || '' })).filter(x => x.title);
+}
+/* TG 推送：按 4000 字符分块发送（HTML 格式） */
+function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+async function pushTelegram(sections, dateTag) {
+  const token = process.env.TELEGRAM_BOT_TOKEN, chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return { ok: false, reason: '未配置 TG' };
+  const chunks = [];
+  let cur = `<b>📰 每日吃瓜速报 · ${escHtml(dateTag)}</b>\n`;
+  for (const s of sections) {
+    let block = `\n<b>${s.emoji} ${escHtml(s.name)}</b>\n`;
+    s.items.forEach((x, i) => { block += `${i + 1}. <a href="${x.url}">${escHtml(x.title)}</a>\n`; });
+    if ((cur + block).length > 4000) { chunks.push(cur); cur = block; }
+    else cur += block;
+  }
+  if (cur.trim()) chunks.push(cur);
+  let sent = 0;
+  for (const text of chunks) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+      });
+      if ((await r.json()).ok) sent++;
+    } catch { /* 忽略单条失败 */ }
+    await new Promise(r => setTimeout(r, 600));
+  }
+  return { ok: sent > 0, sent, total: chunks.length };
+}
+app.get('/api/cron/daily-news', async (req, res) => {
+  const secret = process.env.CRON_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'chigua') || db.boards[0];
+  const bot = db.users.find(u => u.username === 'newsbot');
+  if (!bot || !board) return res.status(500).json({ error: '机器人或板块未就绪' });
+  /* 北京时间日期 */
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const M = now.getUTCMonth() + 1, D = now.getUTCDate();
+  const week = ['日', '一', '二', '三', '四', '五', '六'][now.getUTCDay()];
+  const dateTag = `${M}月${D}日`;
+  const title = `📰 每日吃瓜速报 · ${dateTag}`;
+  /* 当天已发过就跳过 */
+  if (db.topics.some(t => t.userId === bot.id && t.title === title)) return res.json({ ok: true, skipped: true, reason: '今日已播报' });
+  const results = await Promise.all(NEWS_SOURCES.map(async s => ({ ...s, items: (await getNewsNow(s.id)).slice(0, s.n) })));
+  const sec = (s) => {
+    if (!s.items.length) return '';
+    const lines = s.items.map((x, i) => `${i + 1}. [${x.title}](${x.url})`);
+    return `\n## ${s.emoji} ${s.name}\n\n${lines.join('\n')}\n`;
+  };
+  const srcNames = results.filter(s => s.items.length).map(s => s.name).join(' · ');
+  const content = `> 🤖 数据来源：${srcNames}（TrendRadar 同款聚合），机器人每日早上 8 点自动抓取整理，仅供吃瓜参考。\n`
+    + results.map(sec).join('')
+    + `\n---\n🍉 今日份的瓜已送达，欢迎在评论区补充你看到的大瓜～`;
+  const time = nowIso();
+  const topicId = id('tp');
+  const topic = {
+    id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+    createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+    tags: ['每日速报', '吃瓜'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+    pinned: false, recommended: false, price: 0, closed: false,
+    poll: null, bounty: 0, bestReplyId: null,
+    prefix: '速报',
+  };
+  db.topics.push(topic);
+  board.topicCount = (board.topicCount || 0) + 1;
+  saveDb(db);
+  /* 同步推送到 TG */
+  const tg = await pushTelegram(results.filter(s => s.items.length), dateTag).catch(() => ({ ok: false }));
+  res.json({ ok: true, topicId, counts: Object.fromEntries(results.map(s => [s.id, s.items.length])), tg });
+});
+
+/* ===== 电报树洞投稿审核（管理员）：待审核列表 / 通过（同步电报自有频道）/ 拒绝 ===== */
+async function tgPublishTopic(topic) {
+  const token = process.env.TG_BOT_TOKEN || '';
+  const chatRaw = String(process.env.TG_OWN_CHANNEL || '').trim();
+  const chat = !chatRaw || /^-?\d+$/.test(chatRaw) || chatRaw.startsWith('@') ? chatRaw : '@' + chatRaw;
+  if (!token || !chat) return { skipped: true, reason: 'TG 未配置' };
+  const raw = (topic.posts[0] && topic.posts[0].content) || '';
+  const imgM = raw.match(/!\[[^\]]*\]\((https?:[^)\s]+)\)/);
+  let text = ((topic.title || '') + '\n\n' + raw.replace(/!\[[^\]]*\]\([^)]*\)/g, '')).trim();
+  text = text.replace(/https?:\/\/t\.me\/[^\s)]+/g, '').replace(/@\w{3,}/g, '').replace(/\n{3,}/g, '\n\n').trim().slice(0, 4000); /* 过滤电报链接与引流@ */
+  const base = `https://api.telegram.org/bot${token}`;
+  /* TG 投稿带照片：先向 TG 取原图再转发到频道（file_id 只有本机器人可用，走 getFile 下载） */
+  if (topic.tgPhotoFileId) {
+    try {
+      const gf = await (await fetch(`${base}/getFile?file_id=${encodeURIComponent(topic.tgPhotoFileId)}`)).json();
+      const filePath = gf && gf.result && gf.result.file_path;
+      if (filePath) {
+        const fr = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+        if (fr.ok) {
+          const buf = Buffer.from(await fr.arrayBuffer());
+          const fd = new FormData();
+          fd.append('chat_id', chat);
+          fd.append('caption', text.slice(0, 1024));
+          fd.append('protect_content', 'true');
+          fd.append('photo', new Blob([buf]), 'photo.jpg');
+          const resp = await fetch(`${base}/sendPhoto`, { method: 'POST', body: fd });
+          const data = await resp.json().catch(() => ({}));
+          if (data.ok) return { messageId: data.result && data.result.message_id };
+        }
+      }
+    } catch (e) { /* 取图失败则退回纯文字发布 */ }
+  }
+  const payload = imgM
+    ? { url: base + '/sendPhoto', body: { chat_id: chat, photo: imgM[1], caption: text.slice(0, 1024), protect_content: true } }
+    : { url: base + '/sendMessage', body: { chat_id: chat, text: text || topic.title, protect_content: true } };
+  const resp = await fetch(payload.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload.body) });
+  const data = await resp.json().catch(() => ({}));
+  if (!data.ok) throw new Error(data.description || ('TG HTTP ' + resp.status));
+  return { messageId: data.result && data.result.message_id };
+}
+
+/* TG 投稿入口：聊天机器人 webhook 转发来的私聊投稿，进电报树洞待审核（共享密钥 TG_SUBMIT_SECRET） */
+app.post('/api/integrations/tg-submit', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  if (!secret) return res.status(503).json({ error: '投稿入口未启用' });
+  if (String(req.headers['x-sync-secret'] || '') !== secret) return res.status(401).json({ error: '密钥不正确' });
+  const body = req.body || {};
+  const photoFileId = String(body.photoFileId || '');
+  const content = String(body.content || '').trim().slice(0, 4000) || (photoFileId ? '📷 图片投稿' : '');
+  if (!content) return res.status(400).json({ error: '内容为空' });
+  const tgName = String(body.tgName || 'TG用户').trim().slice(0, 30) || 'TG用户';
+  const source = body.source === 'chat' ? 'chat' : 'tg';
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'tg-treehole');
+  if (!board) return res.status(404).json({ error: '树洞板块不存在' });
+  const bot = db.users.find(u => u.username === 'tgbot');
+  if (!bot) return res.status(500).json({ error: '搬运机器人不存在' });
+  const time = nowIso();
+  const title = content.replace(/\s+/g, ' ').slice(0, 30) || '树洞投稿';
+  const topic = {
+    id: id('tp'), title, slug: slugify(title) + '-tg' + Date.now().toString(36), boardId: board.id, userId: bot.id,
+    createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+    tags: [source === 'chat' ? '聊天投稿' : 'TG投稿'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
+    poll: null, bounty: 0, bestReplyId: null, prefix: '',
+    status: 'pending', anonymous: !!body.anonymous, tgSubmitter: tgName, tgSubmitterId: String(body.tgUserId || ''),
+    source,
+    tgPhotoFileId: photoFileId,
+  };
+  topic.posts.push({ id: id('p'), topicId: topic.id, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 });
+  db.topics.push(topic);
+  saveDb(db);
+  await flushNow();
+  res.status(201).json({ ok: true, topicId: topic.id });
+});
+
+/* 自有频道新帖存档：聊天机器人 webhook 实时转发 channel_post，直接发到树洞（按 tgMid+频道去重） */
+app.post('/api/integrations/tg-post', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  if (!secret) return res.status(503).json({ error: '未启用' });
+  if (String(req.headers['x-sync-secret'] || '') !== secret) return res.status(401).json({ error: '密钥不正确' });
+  const body = req.body || {};
+  const tgMid = parseInt(body.tgMid, 10) || 0;
+  const text = String(body.content || '').trim().slice(0, 4000);
+  if (!tgMid || (!text && !body.photoFileId && !body.videoFileId)) return res.status(400).json({ error: '内容为空' });
+  const ownChannel = String(process.env.TG_OWN_CHANNEL || '').replace(/^@/, '');
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'tg-treehole');
+  if (!board) return res.status(404).json({ error: '树洞板块不存在' });
+  if (db.topics.some(t => t.tgMid === tgMid && (t.tgChannel || '') === ownChannel)) return res.json({ ok: true, created: false });
+  const bot = db.users.find(u => u.username === 'tgbot');
+  if (!bot) return res.status(500).json({ error: '搬运机器人不存在' });
+  const time = body.at && !isNaN(new Date(body.at).getTime()) ? new Date(body.at).toISOString() : nowIso();
+  const flat = text.replace(/\s+/g, ' ').trim();
+  const title = flat ? flat.slice(0, 30) : '树洞投稿';
+  const mediaNote = body.photoFileId ? '\n\n🖼 [图片见电报频道原帖]' : (body.videoFileId ? '\n\n🎬 [视频见电报频道原帖]' : '');
+  const content = `> 🤖 转自 Telegram 树洞频道，由「树洞投稿机器人」自动同步\n\n${text}${mediaNote}\n\n[查看原帖](https://t.me/${ownChannel}/${tgMid})`;
+  const topic = {
+    id: id('tp'), title, slug: slugify(title) + '-' + tgMid, boardId: board.id, userId: bot.id,
+    createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+    tags: ['树洞'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
+    poll: null, bounty: 0, bestReplyId: null, prefix: '树洞',
+    tgMid, tgChannel: ownChannel, tgCommentIds: [], tgCommentMin: 0, tgCommentsDone: false,
+  };
+  topic.posts.push({ id: id('p'), topicId: topic.id, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 });
+  db.topics.push(topic);
+  board.topicCount = (board.topicCount || 0) + 1;
+  saveDb(db);
+  await flushNow();
+  res.status(201).json({ ok: true, created: true, topicId: topic.id });
+});
+
+app.get('/api/admin/review-topics', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const list = db.topics.filter(t => t.status === 'pending').sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  res.json({ list: list.map(t => enrichTopic(t, db, { withPosts: true })) });
+});
+
+/* 投稿备注行：来自哪个入口、实名（带投稿人）还是匿名。发布时加到正文头部，存量投稿一次性补齐。 */
+function submissionNoteHeader(db, topic) {
+  const srcLabel = topic.source === 'chat' ? '聊天投稿'
+    : topic.source === 'tg' ? '电报投稿'
+    : topic.source === 'import' ? '电报频道搬运'
+    : (Array.isArray(topic.tags) && topic.tags.includes('聊天投稿')) ? '聊天投稿'
+    : (Array.isArray(topic.tags) && topic.tags.includes('TG投稿')) ? '电报投稿'
+    : '论坛投稿';
+  const au = db.users.find(u => u.id === topic.userId);
+  const who = topic.anonymous
+    ? '匿名投稿'
+    : `实名投稿 · ${topic.tgSubmitter || (au && (au.name || au.username)) || '投稿人'}`;
+  return `> 🌳 来自${srcLabel} · ${who}`;
+}
+
+/* 审核通过的统一动作：公开帖子 + 发电报频道 + 同步聊天树洞频道。总控网页与 TG 机器人按钮共用。 */
+async function doApproveTopic(db, topic) {
+  /* 投稿备注（导入帖已有「转自」落款的不重复加） */
+  const firstPost = topic.posts && topic.posts[0];
+  if (firstPost && typeof firstPost.content === 'string' && !firstPost.content.startsWith('> ')) {
+    firstPost.content = `${submissionNoteHeader(db, topic)}\n\n${firstPost.content}`;
+  }
+  topic.status = 'published';
+  const board = boardById(db, topic.boardId);
+  if (board) board.topicCount = (board.topicCount || 0) + 1;
+  let tg = { skipped: true, reason: 'TG 未配置' };
+  try {
+    tg = await tgPublishTopic(topic);
+    if (tg.messageId) { topic.tgMid = tg.messageId; topic.tgChannel = String(process.env.TG_OWN_CHANNEL || '').replace(/^@/, ''); }
+  } catch (e) {
+    tg = { error: String(e.message || e).slice(0, 200) };
+    topic.tgPublishError = tg.error;
+  }
+  /* 同步到聊天「树洞」频道，机器人代发；失败只记录不拦审核 */
+  let chat = { skipped: true, reason: '聊天同步未配置' };
+  const chatUrl = process.env.CHAT_TREEHOLE_URL || '';
+  const chatSecret = process.env.CHAT_TREEHOLE_SECRET || '';
+  if (chatUrl && chatSecret) {
+    try {
+      const au = db.users.find(u => u.id === topic.userId);
+      const authorName = topic.tgSubmitter || (topic.anonymous ? '' : ((au && (au.name || au.username)) || ''));
+      const r = await fetch(chatUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-sync-secret': chatSecret }, body: JSON.stringify({ topicId: topic.id, authorName, anonymous: !!topic.anonymous, content: ((topic.posts[0] || {}).content || '').slice(0, 4000) }) });
+      chat = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      if (!r.ok) topic.chatSyncError = String((chat && chat.error) || r.status).slice(0, 200);
+    } catch (e) {
+      chat = { error: String(e.message || e).slice(0, 200) };
+      topic.chatSyncError = chat.error;
+    }
+  }
+  return { tg, chat };
+}
+
+app.post('/api/admin/topics/:id/approve', requireAdmin, async (req, res) => {
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === req.params.id);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  if (topic.status !== 'pending') return res.status(400).json({ error: '该帖子不在待审核状态' });
+  const { tg, chat } = await doApproveTopic(db, topic);
+  saveDb(db);
+  await flushNow();
+  res.json({ ok: true, tg, chat, topic: enrichTopic(topic, db) });
+});
+
+/* 机器人审核通道：TG 里点「通过/拒绝」按钮时由聊天后端转发过来（共享密钥 TG_SUBMIT_SECRET） */
+app.post('/api/integrations/tg-review', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  if (!secret) return res.status(503).json({ error: '未启用' });
+  if (String(req.headers['x-sync-secret'] || '') !== secret) return res.status(401).json({ error: '密钥不正确' });
+  const body = req.body || {};
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === String(body.topicId || ''));
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  if (topic.status !== 'pending') return res.status(400).json({ error: '该帖子不在待审核状态' });
+  if (body.action === 'approve') {
+    const { tg, chat } = await doApproveTopic(db, topic);
+    saveDb(db);
+    await flushNow();
+    return res.json({ ok: true, tg, chat });
+  }
+  if (body.action === 'reject') {
+    topic.status = 'rejected';
+    saveDb(db);
+    await flushNow();
+    return res.json({ ok: true });
+  }
+  return res.status(400).json({ error: '未知操作' });
+});
+
+app.post('/api/admin/topics/:id/reject', requireAdmin, async (req, res) => {
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === req.params.id);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  if (topic.status !== 'pending') return res.status(400).json({ error: '该帖子不在待审核状态' });
+  topic.status = 'rejected';
+  saveDb(db);
+  await flushNow();
+  res.json({ ok: true });
+});
+
+/* 机器人删帖通道：密钥校验后删除指定帖子（供机器人后台管理/清理联调帖，共享密钥 TG_SUBMIT_SECRET） */
+app.post('/api/integrations/topic-delete', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  if (!secret) return res.status(503).json({ error: '未启用' });
+  if (String(req.headers['x-sync-secret'] || '') !== secret) return res.status(401).json({ error: '密钥不正确' });
+  const topicId = String((req.body || {}).topicId || '');
+  const db = loadDb();
+  const idx = db.topics.findIndex(t => t.id === topicId);
+  if (idx < 0) return res.status(404).json({ error: '帖子不存在' });
+  const topic = db.topics[idx];
+  if (topic.status === 'published') {
+    const board = boardById(db, topic.boardId);
+    if (board && board.topicCount > 0) board.topicCount -= 1;
+  }
+  db.topics.splice(idx, 1);
+  saveDb(db);
+  await flushNow();
+  res.json({ ok: true, deleted: topicId });
+});
+
+/* 待审列表（机器人通道）：供聊天后台「树洞机器人」页读取统一待审队列（共享密钥 TG_SUBMIT_SECRET） */
+app.get('/api/integrations/review-list', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  if (!secret) return res.status(503).json({ error: '未启用' });
+  if (String(req.headers['x-sync-secret'] || '') !== secret) return res.status(401).json({ error: '密钥不正确' });
+  const db = loadDb();
+  const list = db.topics
+    .filter(t => t.status === 'pending')
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .map(t => ({
+      id: t.id,
+      title: t.title || '',
+      content: String((t.posts[0] || {}).content || '').slice(0, 600),
+      author: t.anonymous ? '匿名' : (t.tgSubmitter || ''),
+      anonymous: !!t.anonymous,
+      source: t.source || (Array.isArray(t.tags) && t.tags.includes('聊天投稿') ? 'chat' : (Array.isArray(t.tags) && t.tags.includes('TG投稿') ? 'tg' : 'forum')),
+      hasPhoto: !!t.tgPhotoFileId,
+      createdAt: t.createdAt || '',
+    }));
+  res.json({ ok: true, list });
+});
+
+/* 同步动态（给聊天后台「树洞机器人」页展示）：树洞板块总量、待审数、旧频道搬运进度、最近帖子的三端同步状态 */
+app.get('/api/integrations/sync-feed', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  const secretOk = secret && String(req.headers['x-sync-secret'] || '') === secret;
+  const staffOk = req.user && STAFF_ROLES.includes(req.user.role);
+  if (!secretOk && !staffOk) return res.status(401).json({ error: '密钥不正确' });
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'tg-treehole');
+  const inBoard = board ? db.topics.filter(t => t.boardId === board.id) : [];
+  const recent = inBoard
+    .slice()
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, 10)
+    .map(t => ({
+      id: t.id,
+      title: t.title || '',
+      createdAt: t.createdAt || '',
+      status: t.status || 'published',
+      source: t.source || (Array.isArray(t.tags) && t.tags.includes('聊天投稿') ? 'chat' : (Array.isArray(t.tags) && t.tags.includes('TG投稿') ? 'tg' : '')),
+      tgMid: t.tgMid || t.tgFromMid || null,
+      tgError: t.tgPublishError || '',
+      chatError: t.chatSyncError || '',
+    }));
+  const st = db.tgSyncState || {};
+  const ownChannel = String(process.env.TG_OWN_CHANNEL || '').replace(/^@/, '');
+  const srcOf = (t) => {
+    if (t.source === 'chat' || t.source === 'tg' || t.source === 'import') return t.source;
+    if (Array.isArray(t.tags) && t.tags.includes('聊天投稿')) return 'chat';
+    if (Array.isArray(t.tags) && t.tags.includes('TG投稿')) return 'tg';
+    if (t.tgFromMid) return 'import';
+    if (t.tgMid && t.tgChannel) return t.tgChannel === ownChannel ? 'tg' : 'import';
+    const body0 = String(((t.posts || [])[0] || {}).content || '');
+    const linkM = body0.match(/t\.me\/([A-Za-z0-9_]+)\//);
+    if (linkM) return linkM[1] === ownChannel ? 'tg' : 'import';
+    if (body0.slice(0, 60).includes('转自 Telegram')) return 'import';
+    return 'forum';
+  };
+  const isPub = (t) => !t.status || t.status === 'published';
+  const published = inBoard.filter(isPub);
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const stats = {
+    total: published.length,
+    pending: inBoard.filter(t => t.status === 'pending').length,
+    rejected: inBoard.filter(t => t.status === 'rejected').length,
+    today: inBoard.filter(t => String(t.createdAt || '').slice(0, 10) === todayKey).length,
+    anonymous: published.filter(t => t.anonymous).length,
+    bySource: {
+      chat: published.filter(t => srcOf(t) === 'chat').length,
+      tg: published.filter(t => srcOf(t) === 'tg').length,
+      forum: published.filter(t => srcOf(t) === 'forum').length,
+      import: published.filter(t => srcOf(t) === 'import').length,
+    },
+  };
+  res.json({
+    ok: true,
+    boardTopicCount: inBoard.filter(isPub).length,
+    pendingCount: inBoard.filter(t => t.status === 'pending').length,
+    stats,
+    backfillDone: !!st.done,
+    legacy: st.legacy ? { channel: st.legacy.channel || '', oldestId: st.legacy.oldestId || 0, done: !!st.legacy.done } : null,
+    migrations: db.tgMigrations && typeof db.tgMigrations === 'object'
+      ? Object.entries(db.tgMigrations).map(([ch, m]) => ({ channel: ch, tag: m.tag || '', anonymous: !!m.anonymous, oldestId: m.oldestId || 0, lastId: m.lastId || 0, done: !!m.done }))
+      : [],
+    recent,
+  });
+});
+
+/* 批量转发：把某个公开 TG 频道的最新 N 条（广告过滤、去重）搬进树洞并同步 TG 频道+聊天频道。
+   管理员在 TG 机器人发 /import 频道名 条数 或聊天后台触发（共享密钥 TG_SUBMIT_SECRET） */
+app.post('/api/integrations/tg-import', async (req, res) => {
+  const secret = process.env.TG_SUBMIT_SECRET || '';
+  const secretOk = secret && String(req.headers['x-sync-secret'] || '') === secret;
+  const staffOk = req.user && STAFF_ROLES.includes(req.user.role);
+  if (!secretOk && !staffOk) return res.status(401).json({ error: '密钥不正确' });
+  const body = req.body || {};
+  const srcChannel = String(body.channel || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '');
+  if (!srcChannel) return res.status(400).json({ error: '频道名不能为空' });
+  const count = Math.min(50, Math.max(1, parseInt(body.count, 10) || 20));
+  const dryRun = !!body.dryRun;
+  /* 日期范围（YYYY-MM-DD）：只搬这段时间内发布的帖子；给了范围就往回翻到起始日期为止 */
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const fromTs = dateRe.test(String(body.from || '')) ? new Date(body.from + 'T00:00:00Z').getTime() : 0;
+  const toTs = dateRe.test(String(body.to || '')) ? new Date(body.to + 'T23:59:59Z').getTime() : 0;
+  const TG_UA = { headers: { 'User-Agent': 'Mozilla/5.0 (JMForumTgSync/1.0)' } };
+  const parseImportPosts = (pageHtml) => {
+    const list = [];
+    const wrapRe = /data-post="[^"/]+\/(\d+)"[\s\S]*?(?=data-post="[^"/]+\/\d+"|<\/main>|$)/g;
+    let mm;
+    while ((mm = wrapRe.exec(pageHtml)) !== null) {
+      const block = mm[0];
+      const mid = parseInt(mm[1], 10);
+      if (!mid) continue;
+      const textM = block.match(/tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/);
+      const text = tgStripHtml(textM ? textM[1] : '').slice(0, 4000);
+      const imgM = block.match(/tgme_widget_message_photo_wrap[^>]*style="[^"]*background-image:url\('([^']+)'\)/);
+      const timeM = block.match(/<time[^>]*datetime="([^"]+)"/);
+      list.push({ mid, text, image: imgM ? imgM[1] : '', at: timeM ? timeM[1] : '' });
+    }
+    list.sort((a, b) => a.mid - b.mid);
+    return list;
+  };
+  /* 从最新页往回翻：无日期范围时凑够 count 条；有范围时翻到起始日期之前为止（最多 12 页） */
+  let posts = [];
+  try {
+    const r = await fetch(`https://t.me/s/${srcChannel}`, TG_UA);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    posts = parseImportPosts(await r.text());
+    let pages = 1;
+    while (posts.length) {
+      const oldest = posts[0];
+      const oldestTs = oldest.at ? new Date(oldest.at).getTime() : 0;
+      const needMore = fromTs ? (oldestTs > fromTs && pages < 12) : (posts.length < count);
+      if (!needMore) break;
+      const before = oldest.mid;
+      const r2 = await fetch(`https://t.me/s/${srcChannel}?before=${before}`, TG_UA);
+      if (!r2.ok) break;
+      const older = parseImportPosts(await r2.text());
+      if (!older.length || older[0].mid >= before) break;
+      posts = older.concat(posts);
+      pages++;
+    }
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: '频道页拉取失败（私有频道或网络问题）：' + e.message });
+  }
+  if (!posts.length) return res.json({ ok: true, imported: 0, skippedAds: 0, skippedDup: 0, error: '没有抓到帖子：频道可能是私有频道，或还没有公开帖子' });
+  /* 日期范围过滤（按发布时间，两端都含） */
+  let inRange = posts;
+  if (fromTs || toTs) {
+    inRange = posts.filter(p => {
+      const ts = p.at ? new Date(p.at).getTime() : 0;
+      if (!ts) return false;
+      if (fromTs && ts < fromTs) return false;
+      if (toTs && ts > toTs) return false;
+      return true;
+    });
+  }
+  const matched = inRange.length;
+  const targets = inRange.slice(-count);
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'tg-treehole');
+  if (!board) return res.status(404).json({ error: '树洞板块不存在' });
+  let bot = db.users.find(u => u.username === 'tgbot');
+  if (!bot) return res.status(500).json({ error: '搬运机器人不存在' });
+  let skippedAds = 0, skippedDup = 0, wouldImport = 0;
+  const imported = [];
+  for (const p of targets) {
+    if (!p.text && !p.image) continue;
+    if (TG_AD_RE.test(p.text)) { skippedAds++; continue; }
+    if (db.topics.some(t => t.tgFromMid === p.mid && t.tgFromChannel === srcChannel)) { skippedDup++; continue; }
+    if (db.topics.some(t => t.boardId === board.id && t.tgMid === p.mid && (t.tgChannel || '') === srcChannel)) { skippedDup++; continue; }
+    if (db.topics.some(t => t.boardId === board.id && t.slug && t.slug.endsWith('-' + p.mid) && ((t.tgChannel || '') === srcChannel || (t.tgFromChannel || '') === srcChannel))) { skippedDup++; continue; }
+    if (dryRun) { wouldImport++; continue; }
+    const time = p.at && !isNaN(new Date(p.at).getTime()) ? new Date(p.at).toISOString() : nowIso();
+    const flat = p.text.replace(/\s+/g, ' ').trim();
+    const title = flat ? flat.slice(0, 30) : '树洞图片投稿';
+    const content = `> 🤖 转自 Telegram 频道 @${srcChannel}，由「树洞投稿机器人」自动同步\n\n${p.text}${p.image ? `\n\n![](${p.image})` : ''}\n\n[查看原帖](https://t.me/${srcChannel}/${p.mid})`;
+    const topic = {
+      id: id('tp'), title, slug: slugify(title) + '-' + p.mid, boardId: board.id, userId: bot.id,
+      createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+      tags: ['频道搬运'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
+      poll: null, bounty: 0, bestReplyId: null, prefix: '树洞',
+      status: 'pending', anonymous: false, tgFromMid: p.mid, tgFromChannel: srcChannel, source: 'import',
+    };
+    topic.posts.push({ id: id('p'), topicId: topic.id, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 });
+    db.topics.push(topic);
+    await doApproveTopic(db, topic); /* 公开 + 发 TG 自有频道 + 同步聊天树洞频道 */
+    imported.push(topic.id);
+  }
+  if (!dryRun && imported.length) { saveDb(db); await flushNow(); }
+  res.json({ ok: true, imported: dryRun ? 0 : imported.length, wouldImport, skippedAds, skippedDup, matched, ranged: !!(fromTs || toTs), topicIds: imported });
+});
+
+/* 📝 博客文章自动同步：每小时拉取博客 search.xml，新文章自动发帖到「博客同步」板块 */
+app.get('/api/cron/blog-sync', async (req, res) => {
+  const secret = process.env.CRON_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  const db = loadDb();
+  /* 机器人账号 */
+  let bot = db.users.find(u => u.username === 'blogbot');
+  if (!bot) {
+    bot = {
+      id: id('u'), username: 'blogbot', name: '博客同步姬', passwordHash: '',
+      avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
+      checkinCoins: 0, lastCheckin: '', favorites: [],
+      bio: '🤖 博客有新文章时自动同步到论坛',
+      signature: '', readme: '', contacts: {}, preferences: {},
+      blocked: false, exp: 0, badges: [], title: '', achievements: {},
+      checkinCount: 0, following: [],
+    };
+    db.users.push(bot);
+  }
+  /* 博客同步板块 */
+  let board = db.boards.find(b => b.slug === 'blog');
+  if (!board) {
+    board = { id: id('b'), name: '博客同步', slug: 'blog', color: '#3b82f6', description: '马老师博客新文章自动同步', topicCount: 0 };
+    db.boards.push(board);
+  }
+  if (!Array.isArray(db.blogSyncedUrls)) db.blogSyncedUrls = [];
+  /* 拉取博客 search.xml */
+  let xml = '';
+  try {
+    const r = await fetch('https://blog.8818618.xyz/search.xml', { headers: { 'User-Agent': 'JMForumBlogSync/1.0' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    xml = await r.text();
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: '博客 search.xml 拉取失败：' + e.message });
+  }
+  const entries = [];
+  const re = /<entry>\s*<title>([\s\S]*?)<\/title>[\s\S]*?<url>([\s\S]*?)<\/url>[\s\S]*?<content[^>]*><!\[CDATA\[([\s\S]*?)\]\]><\/content>/g;
+  let m;
+  while ((m = re.exec(xml)) && entries.length < 50) {
+    entries.push({ title: m[1].trim(), url: m[2].trim(), html: m[3] });
+  }
+  /* 首次运行：只建基线，不补发旧文章，避免一次性刷屏（但同步最新一篇，让当前新文有帖子） */
+  if (!db.blogSyncedUrls.length && entries.length) {
+    const [newest, ...rest] = entries;
+    db.blogSyncedUrls = rest.map(e => e.url);
+    /* 同步最新一篇 */
+    const text = newest.html
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 220);
+    const fullUrl = 'https://blog.8818618.xyz' + newest.url;
+    const title = `📝 ${newest.title}`;
+    const content = `> 🤖 本文由博客自动同步\n\n${text}${text.length >= 220 ? '…' : ''}\n\n📖 [阅读原文](${fullUrl})`;
+    const time = nowIso();
+    const topicId = id('tp');
+    db.topics.push({
+      id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+      createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+      tags: ['博客同步'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+      pinned: false, recommended: false, price: 0, closed: false,
+      poll: null, bounty: 0, bestReplyId: null,
+      prefix: '博客',
+    });
+    board.topicCount = (board.topicCount || 0) + 1;
+    db.blogSyncedUrls.push(newest.url);
+    saveDb(db); await flushNow(); /* serverless 延迟写会被冻结杀掉，必须立即落盘 */
+    return res.json({ ok: true, baseline: true, count: entries.length, synced: [newest.title] });
+  }
+  const forceUrl = req.query.force || ''; /* 强制补同步某篇（绕过去重） */
+  const synced = [];
+  for (const e of entries) {
+    if (synced.length >= 10) break; /* 单次最多同步 10 篇，防刷屏 */
+    const isForced = forceUrl && e.url === forceUrl;
+    if (!isForced && db.blogSyncedUrls.includes(e.url)) continue;
+    const text = e.html
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 220);
+    const fullUrl = 'https://blog.8818618.xyz' + e.url;
+    const title = `📝 ${e.title}`;
+    const content = `> 🤖 本文由博客自动同步\n\n${text}${text.length >= 220 ? '…' : ''}\n\n📖 [阅读原文](${fullUrl})`;
+    const time = nowIso();
+    const topicId = id('tp');
+    db.topics.push({
+      id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+      createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+      tags: ['博客同步'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+      pinned: false, recommended: false, price: 0, closed: false,
+      poll: null, bounty: 0, bestReplyId: null,
+      prefix: '博客',
+    });
+    board.topicCount = (board.topicCount || 0) + 1;
+    db.blogSyncedUrls.push(e.url);
+    synced.push({ title: e.title, url: e.url, topicId });
+  }
+  if (synced.length) { saveDb(db); await flushNow(); } /* 立即落盘，防 serverless 冻结丢数据 */
+  else saveDb(db);
+  res.json({ ok: true, synced });
+});
+
+/* 额外 TG 频道整体迁移注册（如忏悔室）：登记后由 /api/cron/tg-sync 每轮自动搬（新帖+全部历史+评论），
+   带自定义标签与匿名标注。鉴权：TG_SYNC_SECRET / TG_SUBMIT_SECRET / 论坛管理员会话 */
+app.post('/api/integrations/tg-migrate', async (req, res) => {
+  const header = String(req.headers['x-sync-secret'] || '');
+  const secretOk = [process.env.TG_SYNC_SECRET, process.env.TG_SUBMIT_SECRET].some(s => s && header === s);
+  const staffOk = req.user && STAFF_ROLES.includes(req.user.role);
+  if (!secretOk && !staffOk) return res.status(401).json({ error: '密钥不正确' });
+  const body = req.body || {};
+  const migChannel = String(body.channel || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '');
+  if (!migChannel) return res.status(400).json({ error: '频道名不能为空' });
+  if (IS_VERCEL) { try { const fresh = await kvGet(); if (fresh) cacheDb = fresh; } catch (e) { /* 同上 */ } }
+  const db = loadDb();
+  if (!db.tgMigrations || typeof db.tgMigrations !== 'object') db.tgMigrations = {};
+  if (body.remove) {
+    delete db.tgMigrations[migChannel];
+    saveDb(db);
+    await flushNow();
+    return res.json({ ok: true, removed: migChannel });
+  }
+  const existing = db.tgMigrations[migChannel];
+  if (!existing) {
+    db.tgMigrations[migChannel] = {
+      tag: String(body.tag || '').slice(0, 20),
+      anonymous: !!body.anonymous,
+      lastId: 0, oldestId: 0, done: false, emptyHits: 0,
+      registeredAt: nowIso(),
+    };
+  } else {
+    if (body.tag !== undefined) existing.tag = String(body.tag || '').slice(0, 20);
+    if (body.anonymous !== undefined) existing.anonymous = !!body.anonymous;
+    if (body.resume) { existing.done = false; existing.emptyHits = 0; }
+  }
+  saveDb(db);
+  await flushNow();
+  const board = db.boards.find(b => b.slug === 'tg-treehole');
+  const already = board ? db.topics.filter(t => t.boardId === board.id && ((t.tgChannel || '') === migChannel || (t.tgFromChannel || '') === migChannel)).length : 0;
+  res.json({ ok: true, channel: migChannel, migration: db.tgMigrations[migChannel], alreadyImported: already });
+});
+
+/* 全库备份导出（密钥与 tg-sync 相同）：返回 gz1: 压缩全库，供定时备份脚本拉取存档 */
+app.get('/api/integrations/backup', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const ok = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}`);
+  if (!ok) return res.status(401).json({ error: 'unauthorized' });
+  if (IS_VERCEL) { try { const fresh = await kvGet(); if (fresh) cacheDb = fresh; } catch (e) { /* 用现有快照 */ } }
+  const db = loadDb();
+  const packed = 'gz1:' + require('zlib').gzipSync(Buffer.from(JSON.stringify(db), 'utf8')).toString('base64');
+  res.type('text/plain').send(packed);
+});
+
+/* 🌳 TG 频道自动搬运：定时抓 t.me/s/<频道> 公开页，新帖由「树洞搬运」发到「电报树洞」板块（广告过滤，TG_SYNC_SECRET 鉴权） */
+const TG_AD_RE = /广告|推广|赞助|商务合作|招商|代理加盟|开户|充值返|博彩|赌场|下注|稳赚|副业项目|兼职招聘|日入|月入过万|加群|进群|入群|群推荐|频道推荐|优质频道|旗下频道|互推|资源群|福利群|点击链接|立即购买|购买链接|限时优惠|秒杀价|官网直达|客服微信|联系微信|扫码进|欢迎关注|点击下方|点此进入|➡|t\.me\/\+|telegram\.me\/\+/i;
+/* 电报链接剥离（用户定：搬运内容里 t.me/telegram.me 链接一律过滤） */
+const stripTgLinks = (s) => String(s || '')
+  .replace(/\[([^\]]*)\]\((?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/[^)]+\)/gi, '$1')
+  .replace(/(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/[^\s)）」』】>]+/gi, '')
+  .replace(/[ \t]{2,}/g, ' ')
+  .replace(/\n{3,}/g, '\n\n')
+  .trim();
+
+function tgStripHtml(html) {
+  return String(html || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<a [^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (mm, href, text) => {
+      const t = text.replace(/<[^>]+>/g, '');
+      return href && href !== t ? `${t} (${href})` : t;
+    })
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+app.get('/api/cron/tg-sync', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.headers['x-sync-secret'] === secret || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  /* 批量写任务先回源 KV 刷新快照，避免拿实例里的旧数据整库覆盖掉并发写入的新数据 */
+  if (IS_VERCEL) { try { const fresh = await kvGet(); if (fresh) cacheDb = fresh; } catch (e) { /* 刷新失败就用现有快照继续 */ } }
+  const channel = String(process.env.TG_CHANNEL || 'chxpd').replace(/[^A-Za-z0-9_]/g, '');
+  if (!channel) return res.status(400).json({ error: '频道未配置' });
+  const db = loadDb();
+  /* 存量标签补登记：树洞系列标签进标签库，前台才有入口 */
+  if (Array.isArray(db.tags)) { for (const tgName of ['树洞', '忏悔室', '聊天投稿', 'TG投稿']) if (!db.tags.some(x => x.name === tgName)) db.tags.push({ id: id('t'), name: tgName }); }
+  /* 一次性清理（2026-10-04 用户定）：所有导入帖正文尾部的「[查看原帖](t.me/…)」链接全部删掉 */
+  if (!db.viewOriginalStrippedV1) {
+    let strippedPosts = 0;
+    for (const t of db.topics) {
+      for (const p of (t.posts || [])) {
+        if (p.content && p.content.includes('查看原帖')) {
+          const nc = p.content.replace(/\s*\[查看原帖\]\(https:\/\/t\.me\/[^)]+\)/g, '').trim();
+          if (nc !== p.content) { p.content = nc; strippedPosts++; }
+        }
+      }
+    }
+    db.viewOriginalStrippedV1 = { at: nowIso(), posts: strippedPosts };
+  }
+  if (req.query.reset === '1') db.tgSyncState = { lastId: 0, oldestId: 0, done: false }; /* 重置基线：重新搬最近一批+重新回填 */
+  /* 投稿机器人账号 */
+  let bot = db.users.find(u => u.username === 'tgbot');
+  if (!bot) {
+    bot = {
+      id: id('u'), username: 'tgbot', name: '树洞投稿机器人', passwordHash: '',
+      avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
+      checkinCoins: 0, lastCheckin: '', favorites: [],
+      bio: '🌳 树洞投稿机器人：自动同步树洞投稿（广告已过滤）',
+      signature: '', readme: '', contacts: {}, preferences: {},
+      blocked: false, exp: 0, badges: [], title: '', achievements: {},
+      checkinCount: 0, following: [],
+    };
+    db.users.push(bot);
+  }
+  /* 机器人改名（树洞搬运 → 树洞投稿机器人）：账号名/简介对齐一次，存量帖正文里的旧称呼一次性替换 */
+  if (bot.name !== '树洞投稿机器人' || !String(bot.bio || '').includes('树洞投稿机器人')) {
+    bot.name = '树洞投稿机器人';
+    bot.bio = '🌳 树洞投稿机器人：自动同步树洞投稿（广告已过滤）';
+  }
+  if (!db.treeholeBotRenamedV1) {
+    db.treeholeBotRenamedV1 = true;
+    for (const t of db.topics) {
+      if (typeof t.content === 'string' && t.content.includes('树洞搬运')) t.content = t.content.split('树洞搬运').join('树洞投稿机器人');
+      for (const p of (t.posts || [])) {
+        if (typeof p.content === 'string' && p.content.includes('树洞搬运')) p.content = p.content.split('树洞搬运').join('树洞投稿机器人');
+      }
+    }
+  }
+  /* 电报树洞板块 */
+  let board = db.boards.find(b => b.slug === 'tg-treehole');
+  if (!board) {
+    board = { id: id('b'), name: '树洞', slug: 'tg-treehole', color: '#229ed9', description: '树洞投稿自动同步（广告已过滤）', topicCount: 0 };
+    db.boards.push(board);
+  }
+  /* 板块改名（电报树洞 → 树洞，与电报频道、聊天频道同名）：板块名/简介一次对齐，存量帖子标签一并替换 */
+  if (!db.treeholeBoardRenamedV1) {
+    db.treeholeBoardRenamedV1 = true;
+    board.name = '树洞';
+    board.description = '树洞投稿自动同步（广告已过滤）';
+    for (const t of db.topics) {
+      if (Array.isArray(t.tags) && t.tags.includes('电报树洞')) t.tags = t.tags.map(x => (x === '电报树洞' ? '树洞' : x));
+    }
+  }
+  /* 存量投稿补备注：已发布的投稿帖（不含电报搬运）正文头部补「来自X · 实名/匿名」一行 */
+  if (!db.treeholeNoteBackfilledV1) {
+    db.treeholeNoteBackfilledV1 = true;
+    for (const t of db.topics) {
+      if (t.boardId !== board.id) continue;
+      if (t.status && t.status !== 'published') continue;
+      const isSubmission = t.source === 'chat' || t.source === 'tg'
+        || (Array.isArray(t.tags) && (t.tags.includes('聊天投稿') || t.tags.includes('TG投稿')));
+      const p0 = t.posts && t.posts[0];
+      if (isSubmission && p0 && typeof p0.content === 'string' && !p0.content.startsWith('> ')) {
+        p0.content = `${submissionNoteHeader(db, t)}\n\n${p0.content}`;
+      }
+    }
+  }
+  /* 一次性托底（2026-10-04 用户定）：导入帖阅读数不低于真实评论人数 */
+  if (!db.viewFloorV1) {
+    let floored = 0;
+    for (const t of db.topics) {
+      if (t.userId !== bot.id || !Array.isArray(t.posts) || t.posts.length < 2) continue;
+      const n = new Set(t.posts.slice(1).map(p => p.authorName || p.userId)).size;
+      if (n > (t.viewCount || 0)) { t.viewCount = n; floored++; }
+    }
+    db.viewFloorV1 = { at: nowIso(), topics: floored };
+  }
+  /* 一次性迁移（2026-10-04 用户定）：已搬评论的【作者名】前缀改为帖子作者名字段，正文去掉前缀 */
+  if (!db.tgAuthorNameV1) {
+    let renamed = 0;
+    const nameRe = /^【([^】]{1,40})】\s*/;
+    for (const t of db.topics) {
+      if (t.userId !== bot.id || !Array.isArray(t.posts)) continue;
+      t.posts.forEach((p, idx) => {
+        if (idx === 0 || p.authorName || typeof p.content !== 'string') return;
+        const mm = p.content.match(nameRe);
+        if (mm) { p.authorName = mm[1]; p.content = p.content.replace(nameRe, ''); renamed++; }
+      });
+    }
+    db.tgAuthorNameV1 = { at: nowIso(), posts: renamed };
+  }
+  /* 一次性清理（2026-10-04 用户定）：搬移帖正文头部的「来自匿名投稿·转自 Telegram 频道…」备注行全部删掉（投稿备注不动） */
+  if (!db.importHeaderStrippedV1) {
+    let strippedHeaders = 0;
+    const hdrRe = /^> (?:🌳 来自匿名投稿 · 转自 Telegram 频道 @\w+|🤖 转自 Telegram 树洞频道)，由「树洞投稿机器人」自动同步\s*\n+/;
+    for (const t of db.topics) {
+      const p0 = t.posts && t.posts[0];
+      if (p0 && typeof p0.content === 'string' && hdrRe.test(p0.content)) {
+        p0.content = p0.content.replace(hdrRe, '');
+        strippedHeaders++;
+      }
+    }
+    db.importHeaderStrippedV1 = { at: nowIso(), posts: strippedHeaders };
+  }
+  /* 一次性清理（2026-10-04 用户定）：已搬评论剥掉电报链接，广告评论整条删，导入正文也剥链接 */
+  if (!db.tgLinkCleanV1) {
+    let rmPosts = 0, strippedPosts = 0;
+    for (const t of db.topics) {
+      if (t.userId !== bot.id || !Array.isArray(t.posts) || !t.posts.length) continue;
+      let changed = false;
+      const kept = [];
+      t.posts.forEach((p, idx) => {
+        const isFirst = idx === 0;
+        let c = typeof p.content === 'string' ? p.content : '';
+        if (!isFirst && TG_AD_RE.test(c)) { rmPosts++; changed = true; return; } /* 广告评论整条删 */
+        const nc = stripTgLinks(c);
+        if (nc !== c) { strippedPosts++; changed = true; c = nc; }
+        if (!isFirst && !c.trim()) { rmPosts++; changed = true; return; } /* 只剩链接被剥空的评论删掉 */
+        kept.push(c === p.content ? p : { ...p, content: c });
+      });
+      if (changed) {
+        kept.forEach((p, i) => { p.postNumber = i + 1; });
+        t.posts = kept;
+        t.replyCount = Math.max(0, kept.length - 1);
+      }
+    }
+    db.tgLinkCleanV1 = { at: nowIso(), removed: rmPosts, stripped: strippedPosts };
+  }
+  const TG_UA = { headers: { 'User-Agent': 'Mozilla/5.0 (JMForumTgSync/1.0)' } };
+  const parsePosts = (pageHtml) => {
+    const list = [];
+    const wrapRe = /data-post="[^"/]+\/(\d+)"[\s\S]*?(?=data-post="[^"/]+\/\d+"|<\/main>|$)/g;
+    let mm;
+    while ((mm = wrapRe.exec(pageHtml)) !== null) {
+      const block = mm[0];
+      const mid = parseInt(mm[1], 10);
+      if (!mid) continue;
+      const textM = block.match(/tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/);
+      const text = tgStripHtml(textM ? textM[1] : '').slice(0, 4000);
+      const imgM = block.match(/tgme_widget_message_photo_wrap[^>]*style="[^"]*background-image:url\('([^']+)'\)/);
+      const timeM = block.match(/<time[^>]*datetime="([^"]+)"/);
+      list.push({ mid, text, image: imgM ? imgM[1] : '', at: timeM ? timeM[1] : '' });
+    }
+    list.sort((a, b) => a.mid - b.mid);
+    return list;
+  };
+  const state = (db.tgSyncState && typeof db.tgSyncState === 'object') ? db.tgSyncState : (db.tgSyncState = { lastId: 0, oldestId: 0, done: false });
+  /* 同步源切换（chxpd -> 自有频道）时编号从头算，自动重置基线；未搬完的旧频道进度存入 legacy 继续搬完，不丢历史 */
+  if (state.channel && state.channel !== channel) {
+    if (!state.done && state.oldestId > 1 && !state.legacy) state.legacy = { channel: state.channel, oldestId: state.oldestId, done: false, emptyHits: 0 };
+    state.lastId = 0; state.oldestId = 0; state.done = false; state.doneV2 = true; state.emptyHits = 0;
+  }
+  state.channel = channel;
+  let skippedAds = 0;
+  const importOne = (p, srcChannel = channel, opts = {}) => {
+    if (!p.text && !p.image) return 'empty';
+    if (TG_AD_RE.test(p.text)) { skippedAds++; return 'ad'; }
+    /* 已搬过的自动跳过（按来源频道+编号判定，不同频道编号相同也不误伤），防重置/补齐时重复发帖 */
+    if (db.topics.some(t => t.boardId === board.id && t.userId === bot.id && t.slug && t.slug.endsWith('-' + p.mid) && ((t.tgChannel || '') === srcChannel || (t.tgFromChannel || '') === srcChannel))) return 'dup';
+    if (db.topics.some(t => t.tgMid === p.mid && (t.tgChannel || 'chxpd') === srcChannel)) return 'dup';
+    const time = p.at && !isNaN(new Date(p.at).getTime()) ? new Date(p.at).toISOString() : nowIso();
+    const flat = p.text.replace(/\s+/g, ' ').trim();
+    const title = flat ? flat.slice(0, 30) : '树洞图片投稿';
+    const cleanText = stripTgLinks(p.text); /* 电报链接过滤（用户定） */
+    /* 搬移帖不加来源备注行（2026-10-04 用户定），正文就是原内容 */
+    const body = cleanText + (p.image ? `\n\n![](${p.image})` : '');
+    const topicId = id('tp');
+    const newTags = (Array.isArray(opts.tags) && opts.tags.length) ? opts.tags : ['树洞'];
+    /* 标签登记进标签库，侧栏标签云/标签页才有入口（树洞/忏悔室等） */
+    if (!Array.isArray(db.tags)) db.tags = [];
+    for (const tgName of newTags) if (tgName && !db.tags.some(x => x.name === tgName)) db.tags.push({ id: id('t'), name: tgName });
+    db.topics.push({
+      id: topicId, title, slug: slugify(title) + '-' + p.mid, boardId: board.id, userId: bot.id,
+      createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+      tags: newTags, posts: [{ id: id('p'), topicId, userId: bot.id, content: body, createdAt: time, likeCount: 0, postNumber: 1 }],
+      pinned: false, recommended: false, price: 0, closed: false,
+      poll: null, bounty: 0, bestReplyId: null,
+      prefix: '树洞',
+      tgMid: p.mid, tgChannel: srcChannel, tgCommentIds: [], tgCommentMin: 0, tgCommentsDone: false,
+      ...(opts.anonymous ? { anonymous: true } : {}),
+      ...(opts.source ? { source: opts.source } : {}),
+    });
+    board.topicCount = (board.topicCount || 0) + 1;
+    return 'ok';
+  };
+  /* ① 最新一页 */
+  let posts = [];
+  try {
+    const r = await fetch(`https://t.me/s/${channel}`, TG_UA);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    posts = parsePosts(await r.text());
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'TG 频道页拉取失败：' + e.message });
+  }
+  const firstRun = !state.lastId;
+  const pageMax = posts.length ? posts[posts.length - 1].mid : 0;
+  const synced = [];
+  if (posts.length && (!state.lastId || !state.oldestId)) {
+    /* 首次/补齐：整页过一遍（已搬的靠 slug 去重跳过），不留缝隙 */
+    for (const p of posts) { if (importOne(p) === 'ok') synced.push(p.mid); }
+    state.lastId = pageMax;
+    state.oldestId = posts[0].mid;
+  } else {
+    const candidates = posts.filter(p => p.mid > state.lastId).slice(0, 10); /* 新帖单次最多 10 条，积压下轮继续 */
+    let lastProcessed = state.lastId;
+    for (const p of candidates) {
+      lastProcessed = p.mid;
+      if (importOne(p) === 'ok') synced.push(p.mid);
+    }
+    state.lastId = lastProcessed && lastProcessed < pageMax ? lastProcessed : pageMax;
+  }
+  /* ② 历史全量回填：沿 ?before= 往更早翻页，直到频道第一条（广告同样过滤）
+     完成判定宁可保守：只有空页连续两次、或翻到编号 1 才算搬完，避免临时短页误判 */
+  let backfilled = 0;
+  if (state.done && !state.doneV2) { state.done = false; state.doneV2 = true; } /* 旧版误判完成的存量状态，自动恢复一次 */
+  if (!state.done && state.oldestId > 1) {
+    for (let page = 0; page < 3 && !state.done; page++) {
+      let older = [];
+      try {
+        const r2 = await fetch(`https://t.me/s/${channel}?before=${state.oldestId}`, TG_UA);
+        if (r2.ok) older = parsePosts(await r2.text());
+      } catch (e) { break; }
+      if (!older.length) {
+        state.emptyHits = (state.emptyHits || 0) + 1;
+        if (state.emptyHits >= 2) state.done = true;
+        break;
+      }
+      state.emptyHits = 0;
+      const pageMin = older[0].mid;
+      if (pageMin >= state.oldestId) break; /* 编号没推进，防死循环 */
+      for (const p of older) {
+        if (p.mid >= state.oldestId) continue;
+        if (importOne(p) === 'ok') backfilled++;
+      }
+      state.oldestId = pageMin;
+      if (pageMin <= 1) state.done = true;
+    }
+  }
+  /* ②-bis 旧频道剩余历史（同步源切换时保留的 legacy 进度）：每轮顺手搬 2 页，搬完为止 */
+  let legacyBackfilled = 0;
+  if (state.legacy && !state.legacy.done && state.legacy.oldestId > 1) {
+    for (let page = 0; page < 2 && !state.legacy.done; page++) {
+      let older = [];
+      try {
+        const r3 = await fetch(`https://t.me/s/${state.legacy.channel}?before=${state.legacy.oldestId}`, TG_UA);
+        if (r3.ok) older = parsePosts(await r3.text());
+      } catch (e) { break; }
+      if (!older.length) {
+        state.legacy.emptyHits = (state.legacy.emptyHits || 0) + 1;
+        if (state.legacy.emptyHits >= 2) state.legacy.done = true;
+        break;
+      }
+      state.legacy.emptyHits = 0;
+      const pageMin = older[0].mid;
+      if (pageMin >= state.legacy.oldestId) break;
+      for (const p of older) {
+        if (p.mid >= state.legacy.oldestId) continue;
+        if (importOne(p, state.legacy.channel) === 'ok') legacyBackfilled++;
+      }
+      state.legacy.oldestId = pageMin;
+      if (pageMin <= 1) state.legacy.done = true;
+    }
+  }
+  /* ②-ter 额外频道整体迁移（如忏悔室）：注册在 db.tgMigrations 的频道独立于主同步——最新页补新帖、向后翻页搬全部历史，
+     带自定义标签与匿名标注；评论由下面的评论镜像统一接管（topics 记 tgChannel=来源频道） */
+  if (!db.tgMigrations || typeof db.tgMigrations !== 'object') db.tgMigrations = {};
+  let migrated = 0;
+  const migReport = {};
+  for (const [migChannel, mig] of Object.entries(db.tgMigrations)) {
+    if (!mig || mig.done) { if (mig) migReport[migChannel] = { oldestId: mig.oldestId || 0, done: !!mig.done }; continue; }
+    const migOpts = { tags: ['树洞', ...(mig.tag ? [mig.tag] : [])], anonymous: !!mig.anonymous, source: 'import' };
+    try {
+      const rm = await fetch(`https://t.me/s/${migChannel}`, TG_UA);
+      if (rm.ok) {
+        const mposts = parsePosts(await rm.text());
+        if (mposts.length) {
+          if (!mig.lastId) {
+            for (const p of mposts) { if (importOne(p, migChannel, migOpts) === 'ok') migrated++; }
+            mig.lastId = mposts[mposts.length - 1].mid;
+            mig.oldestId = mposts[0].mid;
+          } else {
+            for (const p of mposts.filter(x => x.mid > mig.lastId).slice(0, 10)) {
+              if (importOne(p, migChannel, migOpts) === 'ok') migrated++;
+              if (p.mid > mig.lastId) mig.lastId = p.mid;
+            }
+          }
+        }
+      }
+    } catch (e) { /* 单轮拉取失败不中断，下轮继续 */ }
+    if (!mig.done && mig.oldestId > 1) {
+      for (let page = 0; page < 3 && !mig.done; page++) {
+        let older = [];
+        try {
+          const r4 = await fetch(`https://t.me/s/${migChannel}?before=${mig.oldestId}`, TG_UA);
+          if (r4.ok) older = parsePosts(await r4.text());
+        } catch (e) { break; }
+        if (!older.length) {
+          mig.emptyHits = (mig.emptyHits || 0) + 1;
+          if (mig.emptyHits >= 2) mig.done = true;
+          break;
+        }
+        mig.emptyHits = 0;
+        const pageMin = older[0].mid;
+        if (pageMin >= mig.oldestId) break;
+        for (const p of older) {
+          if (p.mid >= mig.oldestId) continue;
+          if (importOne(p, migChannel, migOpts) === 'ok') migrated++;
+        }
+        mig.oldestId = pageMin;
+        if (pageMin <= 1) mig.done = true;
+      }
+    }
+    migReport[migChannel] = { oldestId: mig.oldestId || 0, lastId: mig.lastId || 0, done: !!mig.done };
+  }
+  /* ③ 评论镜像：把每个帖子在 TG 的评论同步成论坛回帖（由树洞搬运代发，标注原评论者；广告评论同样过滤）
+     讨论页 ?embed=1&discussion=1 服务端直出评论；&comment=<最小ID> 向更早翻页。单轮限额，靠 tgCommentIds 去重续传 */
+  const parseComments = (pageHtml) => {
+    const out = [];
+    for (const seg of String(pageHtml).split('js-widget_message_wrap')) {
+      const idM = seg.match(/data-post-id="(\d+)"/);
+      if (!idM || !seg.includes('?comment=')) continue;
+      const cid = parseInt(idM[1], 10);
+      const aM = seg.match(/tgme_widget_message_author_name[^>]*>([\s\S]{0,160}?)<\/span>/);
+      const author = (aM ? tgStripHtml(aM[1]) : '').slice(0, 40) || '匿名';
+      const texts = [...seg.matchAll(/tgme_widget_message_text js-message_text"[^>]*>([\s\S]*?)<\/div>/g)].map(x => x[1]);
+      const text = texts.length ? tgStripHtml(texts[texts.length - 1]).slice(0, 1500) : '';
+      const imgM = seg.match(/tgme_widget_message_photo_wrap[^>]*style="[^"]*background-image:url\('([^']+)'\)/);
+      const timeM = seg.match(/<time[^>]*datetime="([^"]+)"/);
+      out.push({ cid, author, text, image: imgM ? imgM[1] : '', at: timeM ? timeM[1] : '' });
+    }
+    return out;
+  };
+  let commentsAdded = 0;
+  let commentTopics = 0;
+  const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
+  const allMine = db.topics
+    .filter(t => t.boardId === board.id && (t.userId === bot.id || (typeof t.tgMid === 'number' && t.tgChannel === channel)))
+    .map(t => {
+      if (typeof t.tgMid !== 'number') {
+        const mm = /-(\d+)$/.exec(t.slug || '');
+        t.tgMid = mm ? parseInt(mm[1], 10) : 0;
+      }
+      if (!Array.isArray(t.tgCommentIds)) t.tgCommentIds = [];
+      return t;
+    })
+    .filter(t => t.tgMid > 0);
+  /* 未补完评论的按最近活跃优先（用户先看到的帖先补齐），而不是只按入库顺序 */
+  const ctCandidates = allMine.filter(t => !t.tgCommentsDone).sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt)).slice(0, 16); /* 未完成评论同步的 16 帖 */
+  const ctRefresh = allMine.filter(t => t.tgCommentsDone && new Date(t.createdAt).getTime() > weekAgo).sort((a, b) => b.tgMid - a.tgMid).slice(0, 3); /* 近 7 天已同步完的帖再查最新页，接新评论 */
+  for (const [t, maxPages] of [...ctCandidates.map(t => [t, 3]), ...ctRefresh.map(t => [t, 1])]) {
+    const seen = new Set(t.tgCommentIds || []);
+    const fresh = [];
+    let minSeen = t.tgCommentMin || Infinity;
+    let pages = 0;
+    let reachedOldest = false;
+    let cursor = 0; /* 0=最新页；之后=已抓到的最小评论ID，向更早翻 */
+    while (pages < maxPages) {
+      const url = `https://t.me/${t.tgChannel || channel}/${t.tgMid}?embed=1&discussion=1` + (cursor ? `&comment=${cursor}` : '');
+      let list = [];
+      try {
+        const rr = await fetch(url, TG_UA);
+        if (rr.ok) list = parseComments(await rr.text());
+      } catch (e) { break; }
+      pages++;
+      if (!list.length) { reachedOldest = true; break; }
+      let pageMin = Infinity;
+      for (const c of list) {
+        if (c.cid < pageMin) pageMin = c.cid;
+        if (c.cid < minSeen) minSeen = c.cid;
+        if (seen.has(c.cid)) continue;
+        seen.add(c.cid);
+        const cleanText = stripTgLinks(c.text); /* 电报链接过滤：剥掉 t.me 等链接，只剩链接的评论整条跳过 */
+        if (!cleanText && !c.image) continue;   /* 纯表情/贴纸/纯链接跳过（ID 已记，不会重复抓） */
+        if (TG_AD_RE.test(cleanText)) continue; /* 广告评论不搬 */
+        fresh.push({ ...c, text: cleanText });
+      }
+      if (cursor !== 0 && pageMin >= cursor) { reachedOldest = true; break; } /* 锚点页没再变老 = 到最老一条 */
+      cursor = pageMin;
+      /* 续传：之前已抓到过更老的地方时，从最新页直接跳回上次的最老处继续往下，不重复翻已抓的窗口 */
+      if (pages === 1 && t.tgCommentMin && cursor > t.tgCommentMin) cursor = t.tgCommentMin;
+    }
+    fresh.sort((a, b) => a.cid - b.cid);
+    for (const c of fresh) {
+      if ((t.tgCommentIds || []).length >= 200) break; /* 单帖评论镜像上限 200 条 */
+      const ctime = c.at && !isNaN(new Date(c.at).getTime()) ? new Date(c.at).toISOString() : nowIso();
+      const cbody = `${c.text}${c.image ? `\n\n![](${c.image})` : ''}`.trim();
+      /* 评论挂原作者名（用户定：不要看起来全是机器人在评论） */
+      t.posts.push({ id: id('p'), topicId: t.id, userId: bot.id, authorName: String(c.author || 'TG用户').slice(0, 40), content: cbody, createdAt: ctime, likeCount: 0, postNumber: t.posts.length + 1 });
+      t.replyCount = (t.replyCount || 0) + 1;
+      commentsAdded++;
+    }
+    t.tgCommentIds = [...seen].slice(-400);
+    if (minSeen !== Infinity) t.tgCommentMin = minSeen;
+    /* 阅读数托底（用户定）：多少人评论就至少多少人看过 */
+    const commenters = new Set(t.posts.slice(1).map(p => p.authorName || p.userId));
+    if (commenters.size > (t.viewCount || 0)) t.viewCount = commenters.size;
+    if (reachedOldest || (t.tgCommentIds || []).length >= 200) t.tgCommentsDone = true;
+    if (fresh.length || pages) commentTopics++;
+  }
+  saveDb(db);
+  await flushNow(); /* 立即落盘，防 serverless 冻结丢数据 */
+  res.json({ ok: true, firstRun, synced: synced.length, backfilled, legacyBackfilled, legacyDone: state.legacy ? !!state.legacy.done : true, legacyOldestId: state.legacy ? state.legacy.oldestId : 0, skippedAds, commentsAdded, commentTopics, backfillDone: !!state.done, oldestId: state.oldestId, lastId: state.lastId, migrated, migrations: migReport, saveError: lastKvError || null, sizes: { bytes: (() => { try { return JSON.stringify(db).length; } catch (e) { return -1; } })(), topics: db.topics.length, posts: db.topics.reduce((a, t) => a + ((t.posts || []).length), 0), companies: (db.companies || []).length, users: (db.users || []).length } });
+});
+
+
+/* TG 评论结构探针（临时调试，同一密钥鉴权）：看讨论页服务端 HTML 里评论的标记与分页线索 */
+app.get('/api/cron/tg-probe', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.headers['x-sync-secret'] === secret || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  const channel = String(process.env.TG_CHANNEL || 'chxpd').replace(/[^A-Za-z0-9_]/g, '');
+  const mid = parseInt(req.query.mid || '3563', 10);
+  const url = `https://t.me/${channel}/${mid}?embed=1&discussion=1`;
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (JMForumTgSync/1.0)' } });
+    const html = await r.text();
+    const ids = [...new Set([...html.matchAll(/\?comment=(\d+)/g)].map(m => m[1]))];
+    const authors = [...html.matchAll(/tgme_widget_message_author_name[^>]*>([^<]{1,40})</g)].map(m => m[1]).slice(0, 6);
+    const dateHrefs = [...html.matchAll(/href="(https:\/\/t\.me\/[^"]*\?comment=\d+)"/g)].map(m => m[1]).slice(0, 4);
+    const moreHrefs = [...new Set([...html.matchAll(/href="([^"]*(?:discussion|comment)[^"]*)"/g)].map(m => m[1]))].slice(0, 8);
+    /* 评论三元组提取试跑：作者 / 正文 / 评论ID */
+    const triples = [];
+    const segRe = /tgme_widget_message_author_name[^>]*>([^<]{1,40})<[\s\S]{0,4000}?tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>[\s\S]{0,2000}?\?comment=(\d+)/g;
+    let sm;
+    while ((sm = segRe.exec(html)) !== null && triples.length < 6) {
+      triples.push({ author: sm[1], text: tgStripHtml(sm[2]).slice(0, 60), cid: sm[3] });
+    }
+    const out = {
+      status: r.status, len: html.length,
+      commentAnchors: ids.length, sampleIds: ids.slice(0, 5),
+      authors, dateHrefs, moreHrefs, triples,
+      hasShowMoreText: /more comments/i.test(html),
+      hasWidgetMessageText: (html.match(/tgme_widget_message_text/g) || []).length,
+    };
+    /* 分页试探：?test2= 后缀拼到讨论页 URL 后再抓一次，看评论 ID 是否变化 */
+    if (req.query.test2) {
+      const r2 = await fetch(url + String(req.query.test2), { headers: { 'User-Agent': 'Mozilla/5.0 (JMForumTgSync/1.0)' } });
+      const h2 = await r2.text();
+      out.test2 = { status: r2.status, ids: [...new Set([...h2.matchAll(/\?comment=(\d+)/g)].map(m => m[1]))].slice(0, 8) };
+    }
+    /* 结构取样：第 3 个评论锚点前后的原始 HTML，确认嵌套回复的真实结构 */
+    if (req.query.around) {
+      const idxs = [...html.matchAll(/\?comment=(\d+)/g)].map(m => m.index);
+      const k = Math.min(parseInt(req.query.around, 10) || 2, idxs.length - 1);
+      if (k >= 0) out.around = html.slice(Math.max(0, idxs[k] - 2200), idxs[k] + 120);
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+/* TG 搬运清理：把已搬进「电报树洞」但命中广告规则的帖子删掉（?prune=1，同一密钥鉴权） */
+app.get('/api/cron/tg-prune', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.headers['x-sync-secret'] === secret || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  if (req.query.prune !== '1') return res.status(400).json({ error: '加 ?prune=1 才执行' });
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'tg-treehole');
+  const bot = db.users.find(u => u.username === 'tgbot');
+  if (!board || !bot) return res.json({ ok: true, removed: [] });
+  const removed = [];
+  db.topics = db.topics.filter(t => {
+    if (t.boardId !== board.id || t.userId !== bot.id) return true;
+    /* 只拿投稿原文比对：剥掉机器人署名行与原帖链接尾巴，避免署名里的字眼误伤 */
+    const raw = ((t.posts && t.posts[0] && t.posts[0].content) || '')
+      .replace(/^> .*$/m, '')
+      .replace(/\n\[查看原帖\][\s\S]*$/, '');
+    const hay = (t.title || '') + '\n' + raw;
+    if (TG_AD_RE.test(hay)) { removed.push(t.title); return false; }
+    return true;
+  });
+  if (removed.length) {
+    board.topicCount = Math.max(0, (board.topicCount || 0) - removed.length);
+    saveDb(db);
+    await flushNow();
+  }
+  res.json({ ok: true, removed });
+});
+
+/* TrendRadar AI 解读同步：sandbox 定时任务抓取+AI分析后 POST 内容，由 newsbot 发帖 */
+app.post('/api/cron/trendradar-post', express.json({ limit: '512kb' }), async (req, res) => {
+  const secret = process.env.TRENDRADAR_SECRET || process.env.CRON_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  const { title, content, prefix } = req.body || {};
+  if (!title || !content) return res.status(400).json({ error: 'title/content 必填' });
+  const db = loadDb();
+  const board = db.boards.find(b => b.slug === 'chigua') || db.boards[0];
+  const bot = db.users.find(u => u.username === 'newsbot');
+  if (!bot || !board) return res.status(500).json({ error: '机器人或板块未就绪' });
+  if (db.topics.some(t => t.userId === bot.id && t.title === title)) return res.json({ ok: true, skipped: true, reason: '已存在' });
+  const time = nowIso();
+  const topicId = id('tp');
+  const topic = {
+    id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+    createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+    tags: ['AI解读', '吃瓜'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+    pinned: false, recommended: false, price: 0, closed: false,
+    poll: null, bounty: 0, bestReplyId: null,
+    prefix: prefix || 'AI解读',
+  };
+  db.topics.push(topic);
+  board.topicCount = (board.topicCount || 0) + 1;
+  saveDb(db);
+  res.json({ ok: true, topicId });
+});
+
+/* ================= 热点专区 TrendRadar 报告 ================= */
+const TREND_INDEX_KEY = 'trend:index';
+const trendKey = (k) => `trend:report:${k}`;
+async function kvRawGet(key) {
+  if (!IS_VERCEL) return null;
+  const res = await fetch(`${KV_BASE}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.result ?? null;
+}
+async function kvRawSet(key, val) {
+  if (!IS_VERCEL) return;
+  await fetch(`${KV_BASE}/set/${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' },
+    body: typeof val === 'string' ? val : JSON.stringify(val),
+  });
+}
+/* 上传报告（sandbox 定时任务调用） */
+app.post('/api/cron/trendradar-upload', express.json({ limit: '2mb' }), async (req, res) => {
+  const secret = process.env.TRENDRADAR_SECRET || process.env.CRON_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  const { key, title, dateTag, period, stats, html, html_gzip } = req.body || {};
+  let htmlContent = html;
+  if (html_gzip) {
+    try {
+      const buf = Buffer.from(html_gzip, 'base64');
+      htmlContent = require('zlib').gunzipSync(buf).toString('utf-8');
+    } catch (e) { return res.status(400).json({ error: 'gzip 解压失败' }); }
+  }
+  if (!key || !htmlContent) return res.status(400).json({ error: 'key/html 必填' });
+  try {
+    await kvRawSet(trendKey(key), htmlContent);
+    let idx = await kvRawGet(TREND_INDEX_KEY);
+    idx = idx ? (typeof idx === 'string' ? JSON.parse(idx) : idx) : [];
+    idx = idx.filter(x => x.key !== key);
+    idx.unshift({ key, title, dateTag, period, stats: stats || {}, createdAt: nowIso() });
+    idx = idx.slice(0, 60); /* 保留最近 60 期 */
+    await kvRawSet(TREND_INDEX_KEY, JSON.stringify(idx));
+    res.json({ ok: true, key });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+/* 报告列表 */
+app.get('/api/trends', async (req, res) => {
+  try {
+    let idx = await kvRawGet(TREND_INDEX_KEY);
+    idx = idx ? (typeof idx === 'string' ? JSON.parse(idx) : idx) : [];
+    res.json({ list: idx });
+  } catch (e) { res.json({ list: [] }); }
+});
+/* 单期报告 HTML（完整网页版） */
+app.get('/api/trends/:key/html', async (req, res) => {
+  try {
+    const html = await kvRawGet(trendKey(req.params.key));
+    if (!html) return res.status(404).send('报告不存在');
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(typeof html === 'string' ? html : JSON.stringify(html));
+  } catch (e) { res.status(500).send('读取失败'); }
+});
+
+/* ================= admin: 抽奖管理 ================= */
+app.delete('/api/admin/lottery/:id', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const idx = (db.lotteries || []).findIndex(l => l.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: '抽奖不存在' });
+  const [l] = db.lotteries.splice(idx, 1);
+  modLog(db, '删除抽奖', req.user, '', `《${l.title}》`);
+  saveDb(db);
+  res.json({ ok: true });
 });
 
 /* ================= admin: 通知设置 ================= */
@@ -1839,6 +3902,31 @@ app.post('/api/admin/codes', requireAdmin, (req, res) => {
   res.status(201).json({ codes: created });
 });
 
+/* ================= 用户邀请码 ================= */
+/* 生成邀请码：LV2+ 用户可生成，每码默认 5 次使用 */
+app.post('/api/invites', requireAuth, (req, res) => {
+  const db = loadDb();
+  const lv = userLevel(req.user).level;
+  if (lv < 2) return res.status(403).json({ error: 'LV2 及以上才能生成邀请码，多发帖回帖升级吧' });
+  const myCodes = (db.regCodes || []).filter(c => c.createdBy === req.user.id);
+  if (myCodes.length >= 10) return res.status(400).json({ error: '你最多只能有 10 个邀请码' });
+  const maxUses = Math.max(1, Math.min(20, parseInt((req.body || {}).maxUses) || 5));
+  const rc = { id: id('rc'), code: genRegCode(), note: String(((req.body || {}).note) || '').slice(0, 50), createdBy: req.user.id, maxUses, usedCount: 0, usedByList: [], usedBy: null, usedAt: null, createdAt: nowIso(), expiresAt: null };
+  db.regCodes.push(rc);
+  saveDb(db);
+  res.status(201).json({ code: rc.code, maxUses: rc.maxUses });
+});
+/* 我的邀请码 + 邀请统计 */
+app.get('/api/invites/mine', requireAuth, (req, res) => {
+  const db = loadDb();
+  const codes = (db.regCodes || []).filter(c => c.createdBy === req.user.id).map(c => ({
+    code: c.code, note: c.note || '', maxUses: c.maxUses || 1, usedCount: c.usedCount || 0, createdAt: c.createdAt,
+    invited: (c.usedByList || []).map(uid => { const u = db.users.find(x => x.id === uid); return u ? { username: u.username, name: u.name, createdAt: u.createdAt } : null; }).filter(Boolean),
+  }));
+  const totalInvited = codes.reduce((a, c) => a + c.invited.length, 0);
+  res.json({ codes, totalInvited, rewardPerInvite: 20 });
+});
+
 app.delete('/api/admin/codes/:id', requireAdmin, (req, res) => {
   const db = loadDb();
   const idx = (db.regCodes || []).findIndex(c => c.id === req.params.id);
@@ -1883,6 +3971,26 @@ app.post('/api/admin/users/:id/role', requireAdmin, (req, res) => {
   res.json({ ok: true, user: adminUserJson(u, db) });
 });
 
+/* 站长设置用户等级（LV1-10）：按等级门槛设置经验值，通知用户并记录管理日志 */
+app.post('/api/admin/users/:id/level', requireAdmin, async (req, res) => {
+  const db = loadDb();
+  const u = db.users.find(x => x.id === req.params.id);
+  if (!u) return res.status(404).json({ error: '用户不存在' });
+  if (req.user.role !== 'owner') return res.status(403).json({ error: '仅站长可调整用户等级' });
+  if (u.id === req.user.id) return res.status(400).json({ error: '不能修改自己的等级' });
+  const level = parseInt(req.body && req.body.level, 10);
+  if (!Number.isInteger(level) || level < 1 || level > 10) return res.status(400).json({ error: '等级需为 1-10' });
+  const before = userLevel(u).level;
+  u.exp = LEVELS[level - 1].exp;
+  if (level !== before) {
+    addNotification(db, u.id, 'levelup', { level, title: LEVELS[level - 1].title, byAdmin: true });
+    modLog(db, '调整等级', req.user, u.name, `将 @${u.username} 的等级从 LV${before} 调整为 LV${level}（${LEVELS[level - 1].title}）`);
+  }
+  saveDb(db);
+  await flushNow(); /* 立即落盘，防 serverless 延迟写被冻结丢失 */
+  res.json({ ok: true, user: adminUserJson(u, db) });
+});
+
 app.post('/api/admin/users/:id/ban', requireAdmin, (req, res) => {
   const db = loadDb();
   const u = db.users.find(x => x.id === req.params.id);
@@ -1892,6 +4000,7 @@ app.post('/api/admin/users/:id/ban', requireAdmin, (req, res) => {
   const canBan = req.user.role === 'owner' ? u.role !== 'owner' : u.role === 'user';
   if (!canBan) return res.status(400).json({ error: req.user.role === 'owner' ? '不能封禁站长' : '不能封禁管理员或站长' });
   u.banned = true;
+  modLog(db, '封禁用户', req.user, u.name, `封禁用户 @${u.username}`);
   saveDb(db);
   res.json({ ok: true, user: adminUserJson(u, db) });
 });
@@ -1901,6 +4010,7 @@ app.post('/api/admin/users/:id/unban', requireAdmin, (req, res) => {
   const u = db.users.find(x => x.id === req.params.id);
   if (!u) return res.status(404).json({ error: '用户不存在' });
   u.banned = false;
+  modLog(db, '解封用户', req.user, u.name, `解封用户 @${u.username}`);
   saveDb(db);
   res.json({ ok: true, user: adminUserJson(u, db) });
 });
@@ -1918,6 +4028,7 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
     t.posts.forEach(p => { if (p.userId === u.id) p.userId = GHOST.id; });
   });
   db.users.splice(idx, 1);
+  modLog(db, '删除用户', req.user, u.name, `删除用户 @${u.username}`);
   saveDb(db);
   res.json({ ok: true });
 });
@@ -1942,12 +4053,24 @@ function toggleTopicFlag(req, res, flag) {
   const t = db.topics.find(x => x.id === req.params.id || x.slug === req.params.id);
   if (!t) return res.status(404).json({ error: '帖子不存在' });
   t[flag] = !t[flag];
+  const flagName = { pinned: '置顶', recommended: '推荐', closed: '锁定' }[flag] || flag;
+  modLog(db, (t[flag] ? '设置' : '取消') + flagName, req.user, '', `帖子《${t.title}》`);
   saveDb(db);
   res.json({ ok: true, [flag]: t[flag] });
 }
 app.post('/api/admin/topics/:id/pin', requireAdmin, (req, res) => toggleTopicFlag(req, res, 'pinned'));
 app.post('/api/admin/topics/:id/recommend', requireAdmin, (req, res) => toggleTopicFlag(req, res, 'recommended'));
 app.post('/api/admin/topics/:id/close', requireAdmin, (req, res) => toggleTopicFlag(req, res, 'closed'));
+/* 设置慢速模式（秒，0=关闭） */
+app.post('/api/admin/topics/:id/slowmode', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const topic = db.topics.find(t => t.id === req.params.id);
+  if (!topic) return res.status(404).json({ error: '帖子不存在' });
+  const sec = Math.max(0, Math.min(3600, parseInt((req.body || {}).seconds) || 0));
+  topic.slowMode = sec;
+  saveDb(db);
+  res.json({ ok: true, slowMode: sec });
+});
 
 app.delete('/api/admin/topics/:id', requireAdmin, (req, res) => {
   const db = loadDb();
@@ -1958,16 +4081,18 @@ app.delete('/api/admin/topics/:id', requireAdmin, (req, res) => {
   if (b) b.topicCount = Math.max(0, (b.topicCount || 1) - 1);
   db.topics.splice(idx, 1);
   db.users.forEach(u => { const f = u.favorites || []; const fi = f.indexOf(t.id); if (fi >= 0) f.splice(fi, 1); });
+  modLog(db, '删除帖子', req.user, '', `删除帖子《${t.title}》`);
   saveDb(db);
   res.json({ ok: true });
 });
 
 app.post('/api/admin/boards', requireAdmin, (req, res) => {
   const db = loadDb();
-  const { name, slug, color, description } = req.body || {};
+  const { name, slug, color, description, weight, topicTemplate } = req.body || {};
   if (!name || !slug) return res.status(400).json({ error: '板块名称和 slug 必填' });
   if (db.boards.find(b => b.slug === slug)) return res.status(409).json({ error: 'slug 已存在' });
-  const board = { id: id('b'), name: String(name).slice(0, 20), slug: String(slug).toLowerCase().replace(/[^\w\u4e00-\u9fa5-]/g, '-').slice(0, 30), color: color || '#7b6cf6', description: String(description || '').slice(0, 100), topicCount: 0 };
+  const maxW = db.boards.reduce((m, b) => Math.max(m, b.weight || 0), 0);
+  const board = { id: id('b'), name: String(name).slice(0, 20), slug: String(slug).toLowerCase().replace(/[^\w\u4e00-\u9fa5-]/g, '-').slice(0, 30), color: color || '#7b6cf6', description: String(description || '').slice(0, 100), topicCount: 0, weight: typeof weight === 'number' ? weight : maxW + 10 };
   db.boards.push(board);
   saveDb(db);
   res.status(201).json(board);
@@ -1977,14 +4102,27 @@ app.put('/api/admin/boards/:id', requireAdmin, (req, res) => {
   const db = loadDb();
   const b = boardById(db, req.params.id);
   if (!b) return res.status(404).json({ error: '板块不存在' });
-  const { name, slug, color, description } = req.body || {};
+  const { name, slug, color, description, weight } = req.body || {};
   if (slug && slug !== b.slug && db.boards.find(x => x.slug === slug)) return res.status(409).json({ error: 'slug 已存在' });
   if (name) b.name = String(name).slice(0, 20);
   if (slug) b.slug = String(slug).toLowerCase().replace(/[^\w\u4e00-\u9fa5-]/g, '-').slice(0, 30);
   if (color) b.color = color;
   if (description !== undefined) b.description = String(description || '').slice(0, 100);
+  if (typeof weight === 'number') b.weight = weight;
+  if (topicTemplate !== undefined) b.topicTemplate = String(topicTemplate || '').slice(0, 2000);
   saveDb(db);
   res.json(b);
+});
+
+/* 板块排序：按给定 id 顺序重设 weight */
+app.post('/api/admin/boards/reorder', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids)) return res.status(400).json({ error: 'ids 必填' });
+  ids.forEach((bid, i) => { const b = boardById(db, bid); if (b) b.weight = (i + 1) * 10; });
+  modLog(db, '板块排序', req.user, '', '调整板块显示顺序');
+  saveDb(db);
+  res.json({ ok: true });
 });
 
 app.delete('/api/admin/boards/:id', requireAdmin, (req, res) => {
@@ -2082,8 +4220,9 @@ app.post('/api/admin/companies/batch', requireAdmin, (req, res) => {
   res.json({ ok: true, added, skipped, companies: list.map(c => companyJson(db, c, { withReviews: true })) });
 });
 
-app.put('/api/admin/companies/:id', requireAdmin, (req, res) => {
+app.put('/api/admin/companies/:id', requireAdmin, async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(req.params.id);
   const { hit, inCatalog } = findCompanyMeta(db, req.params.id);
   if (!hit) return res.status(404).json({ error: '公司不存在' });
   if (inCatalog) {
@@ -2116,8 +4255,9 @@ app.put('/api/admin/companies/:id', requireAdmin, (req, res) => {
   res.json(companyJson(db, hit, { withReviews: true }));
 });
 
-app.delete('/api/admin/companies/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/companies/:id', requireAdmin, async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(req.params.id);
   const { hit, inCatalog } = findCompanyMeta(db, req.params.id);
   if (!hit) return res.status(404).json({ error: '公司不存在' });
   if (inCatalog) {
@@ -2135,8 +4275,9 @@ app.delete('/api/admin/companies/:id', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/admin/companies/:id/reviews/:rid', requireAdmin, (req, res) => {
+app.delete('/api/admin/companies/:id/reviews/:rid', requireAdmin, async (req, res) => {
   const db = loadDb();
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(req.params.id);
   const { hit } = findCompanyMeta(db, req.params.id);
   if (!hit) return res.status(404).json({ error: '公司不存在' });
   db.companyReviews = db.companyReviews || {};
@@ -2153,11 +4294,12 @@ app.get('/api/admin/companies/pending', requireAdmin, (req, res) => {
   res.json(list);
 });
 
-app.post('/api/admin/companies/pending/:pid/approve', requireAdmin, (req, res) => {
+app.post('/api/admin/companies/pending/:pid/approve', requireAdmin, async (req, res) => {
   const db = loadDb();
   const item = (db.pendingCompanies || []).find(c => c.id === req.params.pid && c.status === 'pending');
   if (!item) return res.status(404).json({ error: '待审核公司不存在' });
   /* 检查是否重复 */
+  if (COMPANIES_API_URL && !hasNationalCatalog()) await ensureRemoteCompany(item.name);
   const existMeta = findCompanyMeta(db, item.name);
   if (existMeta && existMeta.hit) { item.status = 'rejected'; item.rejectReason = '公司已存在'; saveDb(db); return res.status(409).json({ error: '公司已存在，已自动驳回' }); }
   /* 加入 extraCompanies */
@@ -2229,12 +4371,13 @@ app.get('/api/admin/export', requireAdmin, (req, res) => {
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
+
 /* ================= boot ================= */
 /* 本地直接运行：node server.js；部署到 Vercel：导出 Express app 作为 serverless handler */
 if (require.main === module) {
   boot().then(() => app.listen(PORT, () => {
     console.log(`JM Forum server running at http://localhost:${PORT}`);
     setTimeout(warmSqlCache, 100);
-  }));
+  })).catch(e => { console.error('启动失败:', e.message); process.exit(1); });
 }
 module.exports = app;

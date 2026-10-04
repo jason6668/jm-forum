@@ -25,6 +25,7 @@
     checkinRankList: document.getElementById('checkinRankList'),
     sideBoardList: document.getElementById('sideBoardList'),
     sideTags: document.getElementById('sideTags'),
+    sideUserCard: document.getElementById('sideUserCard'),
     adminLink: document.getElementById('adminLink'),
     darkToggle: document.getElementById('darkToggle'),
     bellBtn: document.getElementById('bellBtn'),
@@ -34,15 +35,30 @@
   };
 
   /* ---------- api ---------- */
+  const apiCache = new Map();
   async function api(path, opts = {}) {
+    const isGet = !opts.method || opts.method === 'GET';
+    if (!isGet) apiCache.clear(); /* 写操作后缓存失效，保证数据新鲜 */
+    else {
+      const hit = apiCache.get(path);
+      if (hit && Date.now() - hit.t < 20000) return hit.d;
+    }
     const res = await fetch(path, { credentials: 'same-origin', ...opts });
     if (!res.ok) {
-      let msg = res.statusText;
-      try { const j = await res.json(); msg = j.error || msg; } catch (e) {}
-      throw new Error(msg);
+      let msg = res.statusText, extra = {};
+      try { const j = await res.json(); msg = j.error || msg; extra = j; } catch (e) {}
+      const err = new Error(msg);
+      if (extra.needLevel) { err.needLevel = extra.needLevel; err.myLevel = extra.myLevel || 0; }
+      throw err;
     }
-    return res.json();
+    const d = await res.json();
+    if (isGet) {
+      apiCache.set(path, { t: Date.now(), d });
+      if (apiCache.size > 80) apiCache.delete(apiCache.keys().next().value);
+    }
+    return d;
   }
+  function prefetch(path) { api(path).catch(() => {}); }
 
   /* ---------- utils ---------- */
   function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
@@ -181,7 +197,7 @@
   function parseHtml(str) {
     const text = String(str ?? '');
     const blocks = [];
-    const safe = text.replace(/```([\s\S]*?)```/g, (m, code) => { blocks.push(code); return `\u0000${blocks.length - 1}\u0000`; });
+    const safe = text.replace(/```([\s\S]*?)```/g, (m, code) => { blocks.push(escHtml(code)); return `\u0000${blocks.length - 1}\u0000`; });
     let s = escHtml(safe);
     const inlines = [];
     s = s.replace(/`([^`\n]+)`/g, (m, c) => { inlines.push(c); return `\u0001${inlines.length - 1}\u0001`; });
@@ -229,6 +245,8 @@
     const pin = t.pinned ? '<span class="badge badge-pin">置顶</span>' : '';
     const rec = t.recommended ? '<span class="badge badge-rec">推荐阅读</span>' : '';
     const price = t.price ? `<span class="badge badge-price">¥ ${t.price}</span>` : '';
+    const lock = (t.minLevel || 1) > 1 ? `<span class="badge badge-lock" title="LV${t.minLevel} 及以上可见">🔒 LV${t.minLevel}</span>` : '';
+    const closed = t.closed ? '<span class="badge badge-closed">只读</span>' : '';
     const tags = (t.tags || []).map(x => `<a class="tag-chip tag-link" href="/tag/${encodeURIComponent(x)}">${esc(x)}</a>`).join('');
     const last = t.lastReply ? `
       <span class="sep">·</span> 最后回复 <a href="/space/${esc(t.lastReply.username)}">${esc(t.lastReply.name)}</a>
@@ -237,8 +255,16 @@
     return `
       <div class="post-row">
         ${stripe}
+        <div class="post-row-head">
+          <a href="/space/${esc(t.author.username)}"><img src="${esc(avatar(t.author))}" alt="" loading="lazy"></a>
+          <div class="prh-id">
+            <a class="prh-name" href="/space/${esc(t.author.username)}">${esc(t.author.name)}</a>${roleTag(t.author)}
+            <span class="prh-time">${fmtTime(t.createdAt)}</span>
+          </div>
+          ${bd ? `<a class="prh-board badge badge-bd" style="background:${esc(bd.color)}" href="/?board=${esc(bd.slug)}">${esc(bd.name)}</a>` : ''}
+        </div>
         <div class="post-row-main">
-          <a class="post-row-title" href="/post/${esc(t.slug)}">${badge}${pin}${rec}${price}${esc(t.title)}</a>
+          <a class="post-row-title" href="/post/${esc(t.slug)}">${badge}${pin}${rec}${price}${lock}${closed}${esc(t.title)}</a>
           <div class="post-row-tags">${tags}</div>
           <div class="post-row-meta">
             <a href="/space/${esc(t.author.username)}">${esc(t.author.name)}</a>${roleTag(t.author)}
@@ -247,8 +273,9 @@
           </div>
         </div>
         <div class="post-row-stats">
-          <span class="stat-line stat-views">👁 <span class="v">${fmtNum(t.viewCount)}</span></span>
-          <span class="stat-line stat-comments">💬 <span class="v">${fmtNum(t.replyCount)}</span></span>
+          <span class="stat-line stat-views"><span class="stat-ic">👁</span> <span class="v">${fmtNum(t.viewCount)}</span><span class="stat-lbl">阅读</span></span>
+          <span class="stat-sep">/</span>
+          <span class="stat-line stat-comments"><span class="stat-ic">💬</span> <span class="v">${fmtNum(t.replyCount)}</span><span class="stat-lbl">回复</span></span>
         </div>
       </div>
     `;
@@ -271,7 +298,8 @@
 
   function sortTabsHtml(current) {
     return `<div class="sort-tabs">
-      <a href="#" data-sort="latest" class="${current === 'latest' ? 'active' : ''}">最新</a>
+      <a href="#" data-sort="latest" class="${current === 'latest' ? 'active' : ''}">最新回复</a>
+      <a href="#" data-sort="new" class="${current === 'new' ? 'active' : ''}">新帖子</a>
       <a href="#" data-sort="hot" class="${current === 'hot' ? 'active' : ''}">热门</a>
       <a href="#" data-sort="views" class="${current === 'views' ? 'active' : ''}">浏览</a>
     </div>`;
@@ -302,6 +330,16 @@
       `).join('');
     } catch (e) { els.checkinRankList.innerHTML = '<li class="muted">加载失败</li>'; }
   }
+  async function loadHot24() {
+    const el = document.getElementById('hot24List');
+    if (!el) return;
+    try {
+      const { list } = await api('/api/hot24');
+      el.innerHTML = (list || []).slice(0, 8).map((t, i) => `
+        <li><a href="/post/${t.slug || t.id}" class="r-name">${i + 1}. ${esc(t.title)}</a></li>
+      `).join('') || '<li class="muted">暂无热文</li>';
+    } catch (e) { el.innerHTML = '<li class="muted">加载失败</li>'; }
+  }
   async function renderCheckinPanel() {
     if (!state.user) {
       els.checkinPanel.innerHTML = `<p class="muted" style="margin-top:0">登录后每日签到，领取 3~5 个鸡腿 🍗</p><a href="/login" class="btn btn-primary btn-block">登录签到</a>`;
@@ -317,6 +355,34 @@
     `;
     const btn = document.getElementById('doCheckin');
     if (btn) btn.addEventListener('click', doCheckin);
+  }
+
+  /* 侧栏用户卡片：登录后显示在右侧栏顶部，未登录隐藏 */
+  function renderSideUserCard() {
+    const el = els.sideUserCard;
+    if (!el) return;
+    if (!state.user) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+    const u = state.user;
+    el.classList.remove('hidden');
+    el.innerHTML = `
+      <div class="suc-head">
+        <a href="/space/${esc(u.username)}"><img class="suc-avatar" src="${esc(avatar(u))}" alt=""></a>
+        <div class="suc-id">
+          <div class="suc-name"><a href="/space/${esc(u.username)}">${esc(u.name)}</a>${roleTag(u)}</div>
+          <div class="suc-meta">@${esc(u.username)} · ${esc(u.levelTitle || '')}</div>
+        </div>
+        ${levelTag(u)}
+      </div>
+      ${expBar(u)}
+      <div class="suc-stats">
+        <span>🍗 鸡腿 <b style="color:var(--accent)">${u.coins || 0}</b></span>
+        <span>经验 <b>${(u.exp || 0).toLocaleString()}</b></span>
+      </div>
+      <div class="suc-links">
+        <a href="/space/${esc(u.username)}">📝 我的帖子</a>
+        <a href="/favorites">⭐ 我的收藏</a>
+        <a href="/settings">⚙️ 个人设置</a>
+      </div>`;
   }
 
   async function doCheckin() {
@@ -338,15 +404,66 @@
   }
 
   /* ---------- pages ---------- */
-  async function renderHome(boardSlug, sort, page = 1) {
+  async function renderHome(boardSlug, sort, page = 1, feed = '') {
     const qs = new URLSearchParams();
-    if (boardSlug) qs.set('board', boardSlug);
-    if (sort) qs.set('sort', sort);
+    if (feed === 'following') qs.set('following', '1');
+    else { if (boardSlug) qs.set('board', boardSlug); if (sort) qs.set('sort', sort); }
     qs.set('page', page);
-    const [data] = await Promise.all([api('/api/topics?' + qs.toString()), loadBoards(), loadTags(), loadCheckinRank()]);
+    const [data] = await Promise.all([api('/api/topics?' + qs.toString()), loadBoards(), loadTags()]);
     const topics = data.list || [];
     const pages = data.pages || 1;
     const cur = Math.min(page, pages);
+    /* 关注流：只看关注的人发的帖子 */
+    if (feed === 'following') {
+      const buildUrl = (p) => '/?feed=following' + (p > 1 ? `&page=${p}` : '');
+      let recHtml = '';
+      if (!topics.length) {
+        const rec = await api('/api/rank/active').catch(() => []);
+        const myFollowing = new Set((state.user && state.user.following) || []);
+        const users = (Array.isArray(rec) ? rec : []).filter(u => !state.user || (u.id !== state.user.id && !myFollowing.has(u.id))).slice(0, 6);
+        recHtml = `
+          <div class="card follow-empty">
+            <div class="follow-empty-ic">👥</div>
+            <div class="follow-empty-t">快去关注你感兴趣的用户吧！</div>
+            <p class="muted">关注后，这里会显示他们发布的最新帖子</p>
+            ${state.user ? '' : `<a class="btn btn-primary" href="/login?next=${encodeURIComponent('/?feed=following')}">登录查看关注动态</a>`}
+          </div>
+          ${users.length ? `<div class="follow-rec">
+            <div class="follow-rec-t">为你推荐</div>
+            ${users.map(u => `
+              <div class="follow-rec-item">
+                <a href="/space/${esc(u.username)}"><img src="${esc(u.avatar || '/assets/logo.png')}" alt="" loading="lazy"></a>
+                <div class="fri-id">
+                  <a class="fri-name" href="/space/${esc(u.username)}">${esc(u.name)}</a>
+                  <span class="fri-tag">社区活跃用户 · 近7天 ${u.total} 条动态</span>
+                </div>
+                <button class="btn btn-sm btn-primary follow-btn" data-username="${esc(u.username)}" data-id="${esc(u.id)}">+ 关注</button>
+              </div>`).join('')}
+          </div>` : ''}`;
+      }
+      renderPage(`
+        <div class="card" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+          <div style="font-weight:700">👀 关注动态</div>
+          <div class="muted" style="font-size:13px">只看你关注的人发的帖子</div>
+        </div>
+        ${topics.length ? postListHtml(topics) + (pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : '') : recHtml}
+      `);
+      document.querySelectorAll('.follow-btn').forEach(b => b.addEventListener('click', async () => {
+        if (!state.user) return route('/login?next=' + encodeURIComponent('/?feed=following'));
+        try {
+          const r = await api('/api/users/' + encodeURIComponent(b.dataset.username) + '/follow', { method: 'POST' });
+          const myF = state.user.following || (state.user.following = []);
+          if (r.following) { if (!myF.includes(b.dataset.id)) myF.push(b.dataset.id); }
+          else { const i = myF.indexOf(b.dataset.id); if (i >= 0) myF.splice(i, 1); }
+          b.textContent = r.following ? '✓ 已关注' : '+ 关注';
+          b.classList.toggle('btn-primary', !r.following);
+          b.classList.toggle('btn-outline', r.following);
+          toast(r.following ? '已关注' : '已取消关注');
+        } catch (e) { toast(e.message, 'err'); }
+      }));
+      setNav('home');
+      return;
+    }
     const title = boardSlug ? boardBySlug(boardSlug)?.name + '板块' : '最新帖子';
     const buildUrl = (p) => {
       const p2 = new URLSearchParams();
@@ -368,7 +485,8 @@
         </a>` : ''}
       <div class="card" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
         <div style="font-weight:700">${esc(title)}</div>
-        <div style="display:flex;align-items:center;gap:12px">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          ${pages > 1 ? pager(cur, pages, buildUrl, true) : ''}
           ${sortTabsHtml(sort || 'latest')}
           ${state.user ? `<a href="/compose" class="btn btn-primary btn-sm">✍️ 发帖</a>` : ''}
         </div>
@@ -387,25 +505,323 @@
         const sort = a.dataset.sort;
         if (sort === current) return;
         const base = boardSlug ? `/?board=${encodeURIComponent(boardSlug)}` : '/';
-        route(base + (sort === 'latest' ? '' : `&sort=${sort}`));
+        route(base + (sort === 'latest' ? '' : (base === '/' ? '?' : '&') + 'sort=' + sort));
       });
     });
   }
 
-  async function renderBoards() {
+  /* 板块频道：横滑板块 tabs + 帖子列表（虎扑赛事式） */
+  async function renderBoards(boardSlug = '', page = 1) {
     await loadBoards();
+    const qs = new URLSearchParams();
+    if (boardSlug) qs.set('board', boardSlug);
+    qs.set('page', page);
+    const [data] = await Promise.all([api('/api/topics?' + qs.toString())]);
+    const topics = data.list || [];
+    const pages = data.pages || 1;
+    const cur = Math.min(page, pages);
+    const buildUrl = (p) => '/boards' + (boardSlug ? `?board=${encodeURIComponent(boardSlug)}` : '') + (p > 1 ? `${boardSlug ? '&' : '?'}page=${p}` : '');
     renderPage(`
-      ${sectionTitle('全部板块', state.boards.length + ' 个板块')}
-      <div class="boards-grid">
+      <div class="board-tabs ch-board-tabs">
+        <a href="/boards" class="${!boardSlug ? 'active' : ''}">全部</a>
         ${state.boards.map(b => `
-          <a class="board-card" href="/?board=${esc(b.slug)}" style="border-top:3px solid ${esc(b.color)}">
-            <h3><span class="bd-dot" style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${esc(b.color)};margin-right:7px"></span>${esc(b.name)}</h3>
-            <p>${esc(b.description || '')}</p>
-            <span class="bd-count">${b.topicCount} 个主题</span>
+          <a href="/boards?board=${esc(b.slug)}" class="${boardSlug === b.slug ? 'active' : ''}">
+            <span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}
           </a>`).join('')}
+        <a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>
       </div>
+      ${pages > 1 ? `<div style="display:flex;justify-content:flex-end;margin:2px 2px 10px">${pager(cur, pages, buildUrl, true)}</div>` : ''}
+      ${postListHtml(topics)}
+      ${pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : ''}
     `);
     setNav('boards');
+  }
+
+  /* ⭐ 推荐阅读：精选帖（管理员推荐）+ 热门帖聚合 */
+  async function renderFeatured() {
+    const [feat, hot] = await Promise.all([
+      api('/api/topics?recommended=1&pageSize=50'),
+      api('/api/topics?sort=hot&pageSize=24'),
+    ]);
+    const featList = feat.list || [];
+    const featIds = new Set(featList.map(t => t.id));
+    const hotList = (hot.list || []).filter(t => !featIds.has(t.id)).slice(0, 20);
+    renderPage(`
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-size:20px;font-weight:800">⭐ 推荐阅读</div>
+        <p class="muted" style="margin:6px 0 0">管理员精选的好帖 + 全站最热讨论，时间不多时从这里开始看。</p>
+      </div>
+      ${sectionTitle('⭐ 精选帖', featList.length ? `共 ${featList.length} 篇` : '')}
+      ${featList.length ? postListHtml(featList) : `<div class="empty-state"><div class="big">⭐</div><p>暂无精选帖，管理员会在后台把好帖设为「推荐」。</p></div>`}
+      ${sectionTitle('🔥 热门帖', '按阅读与回复综合排序')}
+      ${hotList.length ? postListHtml(hotList) : `<div class="empty-state"><div class="big">🔥</div><p>暂无热门帖</p></div>`}
+    `);
+    setNav('featured');
+  }
+
+  /* 🌱 新人墙：最近注册的 30 位新用户 */
+  async function renderNewbies() {
+    const data = await api('/api/users/new');
+    const list = data.list || [];
+    renderPage(`
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-size:20px;font-weight:800">🌱 新人墙</div>
+        <p class="muted" style="margin:6px 0 0">最近加入社区的新朋友，点进去打个招呼吧。</p>
+      </div>
+      ${list.length ? `<div class="newbie-grid">${list.map(u => `
+        <a class="newbie-card" href="/space/${esc(u.username)}">
+          <img src="${esc(avatar(u))}" alt="" loading="lazy">
+          <div class="nb-name">${esc(u.name || u.username)}</div>
+          <div class="nb-meta">@${esc(u.username)}</div>
+          <div class="nb-lv">${levelTag(u)}</div>
+          <div class="nb-time">${fmtDateTime(u.createdAt)} 加入</div>
+        </a>`).join('')}</div>` : `<div class="empty-state"><div class="big">🌱</div><p>还没有新用户</p></div>`}
+    `);
+    setNav('newbies');
+  }
+
+  /* 🎲 幸运抽奖：列表 + 发起（确定性洗牌，种子公开可复算） */
+  async function renderLucky() {
+    const list = await api('/api/lottery');
+    const me = state.user;
+    const card = (l) => {
+      const drawn = l.status === 'drawn';
+      const cond = l.drawAt ? `⏰ ${fmtDateTime(l.drawAt)} 开奖` : (l.targetFloors ? `🎯 回复满 ${l.targetFloors} 楼开奖` : '');
+      return `
+      <div class="card" style="padding:16px;margin-bottom:12px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-size:17px;font-weight:800">🎲 ${esc(l.title)}</span>
+          <span class="board-chip" style="--bc:${drawn ? '#888' : '#185a56'}">${drawn ? '已开奖' : '进行中'}</span>
+        </div>
+        <p class="muted" style="margin:8px 0 0">
+          关联帖子：<a href="/post/${esc(l.topicSlug || l.topicId)}">${esc(l.topicTitle || '查看帖子')}</a><br>
+          🎁 ${l.prizeCount} 份奖品 · 从 ${l.startFloor} 楼开始抽 · ${l.dedupe === false ? '可重复中奖' : '每人只中一次'}<br>
+          ${cond} · 由 ${esc(l.createdByName || '')} 发起于 ${fmtDateTime(l.createdAt)}
+        </p>
+        ${drawn ? `<div style="margin-top:10px">
+          <div style="font-weight:700">🏆 中奖名单</div>
+          <p style="margin:6px 0 0">${(l.winners || []).map(w => `#${w.floor} 楼 ${esc(w.name)}${w.username ? `（@${esc(w.username)}）` : ''}`).join('、') || '暂无有效参与楼层'}</p>
+          <p class="muted" style="margin:6px 0 0;font-size:12px">${esc(l.seedInfo || '')}</p>
+        </div>` : `<p class="muted" style="margin:8px 0 0">去帖子里回复即可参与，开奖结果由公开种子复算，绝对公平。</p>`}
+      </div>`;
+    };
+    renderPage(`
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-size:20px;font-weight:800">🎲 幸运抽奖</div>
+        <p class="muted" style="margin:6px 0 0">回帖即参与，Fisher-Yates 洗牌 + 公开种子，结果人人可复算验证。</p>
+      </div>
+      ${me ? `
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-weight:800;margin-bottom:10px">发起新抽奖（自己帖子的楼主或管理员）</div>
+        <input id="lk-topic" placeholder="帖子链接或帖子 ID（如 /post/xxx 里的 xxx）" style="width:100%;margin-bottom:8px">
+        <input id="lk-title" placeholder="抽奖标题（可选）" maxlength="40" style="width:100%;margin-bottom:8px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+          <input id="lk-prize" type="number" min="1" max="100" value="1" style="flex:1;min-width:110px" placeholder="奖品份数">
+          <input id="lk-floor" type="number" min="2" value="2" style="flex:1;min-width:110px" placeholder="起始楼层">
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+          <input id="lk-drawat" type="datetime-local" style="flex:1;min-width:180px">
+          <input id="lk-target" type="number" min="1" style="flex:1;min-width:150px" placeholder="或：回复满 N 楼开奖">
+        </div>
+        <label class="muted" style="display:block;margin-bottom:10px"><input id="lk-dedupe" type="checkbox" checked> 每人只中一次</label>
+        <button class="btn-primary" id="lk-create" style="min-height:44px;padding:0 18px">发起抽奖</button>
+        <span class="muted" id="lk-msg" style="margin-left:10px"></span>
+      </div>` : `
+      <div class="card" style="padding:14px 16px;margin-bottom:14px">
+        <a href="/login">登录</a> <span class="muted">后可为自己的帖子发起抽奖。</span>
+      </div>`}
+      ${sectionTitle('🎲 全部抽奖', `共 ${list.length} 个`)}
+      ${list.length ? list.map(card).join('') : `<div class="empty-state"><div class="big">🎲</div><p>还没有抽奖，来发起第一个吧。</p></div>`}
+    `);
+    setNav('lucky');
+    const btn = document.getElementById('lk-create');
+    if (btn) btn.addEventListener('click', async () => {
+      const msg = document.getElementById('lk-msg');
+      let topicId = document.getElementById('lk-topic').value.trim();
+      const m = topicId.match(/\/post\/([^/?#]+)/);
+      if (m) topicId = decodeURIComponent(m[1]);
+      if (!topicId) { msg.textContent = '请先填帖子链接或 ID'; return; }
+      const drawVal = document.getElementById('lk-drawat').value;
+      const body = {
+        topicId,
+        title: document.getElementById('lk-title').value.trim(),
+        prizeCount: parseInt(document.getElementById('lk-prize').value || '1', 10),
+        startFloor: parseInt(document.getElementById('lk-floor').value || '2', 10),
+        dedupe: document.getElementById('lk-dedupe').checked,
+        drawAt: drawVal ? new Date(drawVal).toISOString() : null,
+        targetFloors: parseInt(document.getElementById('lk-target').value || '', 10) || null,
+      };
+      if (!body.drawAt && !body.targetFloors) { msg.textContent = '请设置开奖时间或目标楼层数'; return; }
+      btn.disabled = true; msg.textContent = '提交中…';
+      try {
+        await api('/api/lottery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        msg.textContent = '已发起！';
+        await renderLucky();
+      } catch (e) { msg.textContent = e.message || '发起失败'; btn.disabled = false; }
+    });
+  }
+
+  /* ⚖️ 管理记录公示：封禁 / 删帖 / 置顶等操作公开可查 */
+  async function renderRuling(params) {
+    const page = Math.max(1, parseInt((params && params.get('page')) || '1', 10));
+    const data = await api('/api/modlogs?page=' + page);
+    const logs = data.logs || [];
+    const pages = Math.max(1, Math.ceil((data.total || 0) / (data.pageSize || 30)));
+    const row = (l) => `
+      <div style="display:flex;gap:10px;padding:11px 0;border-bottom:1px solid var(--border)">
+        <span class="board-chip" style="--bc:#185a56;flex-shrink:0">${esc(l.action)}</span>
+        <div style="min-width:0">
+          <div>${l.target ? `<b>${esc(l.target)}</b> ` : ''}${esc(l.detail || '')}</div>
+          <div class="muted" style="font-size:12px;margin-top:2px">操作人 ${esc(l.admin || '系统')} · ${fmtDateTime(l.createdAt)}</div>
+        </div>
+      </div>`;
+    renderPage(`
+      <div class="card" style="padding:16px;margin-bottom:14px">
+        <div style="font-size:20px;font-weight:800">⚖️ 管理记录公示</div>
+        <p class="muted" style="margin:6px 0 0">所有封禁、删帖、置顶、锁定等管理操作都在这里公开，管理透明可查。有异议可私信管理员申诉。</p>
+      </div>
+      <div class="card" style="padding:6px 16px">
+        ${logs.length ? logs.map(row).join('') : `<div class="empty-state"><div class="big">⚖️</div><p>暂无管理记录</p></div>`}
+      </div>
+      ${pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center;gap:14px;align-items:center">
+        ${page > 1 ? `<a href="/ruling?page=${page - 1}">‹ 上一页</a>` : ''}
+        <span class="muted">${page} / ${pages}</span>
+        ${page < pages ? `<a href="/ruling?page=${page + 1}">下一页 ›</a>` : ''}
+      </div>` : ''}
+    `);
+    setNav('ruling');
+  }
+
+  async function renderTrends(tab) {
+    const tabs = `
+      <div class="board-tabs">
+        <a href="/trends?tab=day" class="${tab === 'day' ? 'active' : ''}">24 小时</a>
+        <a href="/trends?tab=week" class="${tab === 'week' ? 'active' : ''}">7 天</a>
+        <a href="/trends?tab=month" class="${tab === 'month' ? 'active' : ''}">30 天</a>
+      </div>`;
+    const days = tab === 'week' ? 7 : tab === 'month' ? 30 : 1;
+    const { list } = await api('/api/hot24?days=' + days);
+    const medal = i => i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `<span class="trend-no">${i + 1}</span>`;
+    renderPage(`
+      <div class="rank-card">
+        <h2>🔥 热点 <span class="muted" style="font-size:13px;font-weight:400">按点赞 / 回复 / 浏览 / 收藏综合热度</span></h2>
+        ${tabs}
+        <div class="trend-list">
+          ${list.map((t, i) => `
+            <a class="trend-item" href="/post/${t.slug || t.id}">
+              <span class="trend-medal">${medal(i)}</span>
+              <span class="trend-main">
+                <span class="trend-title">${t.prefix ? `<span class="prefix-tag">${esc(t.prefix)}</span>` : ''}${esc(t.title)}</span>
+                <span class="trend-meta"><span class="board-chip" style="--bc:${t.boardColor}">${esc(t.boardName)}</span> <span class="trend-counts">👍 ${t.likeCount} · 💬 ${t.replyCount} · 👁 ${t.viewCount}</span> <span class="trend-heat">🔥 ${fmtNum(t.likeCount * 3 + t.replyCount * 2 + t.viewCount * 0.1)}</span></span>
+              </span>
+              <span class="trend-time muted">${fmtTime(t.bumpedAt)}</span>
+            </a>`).join('') || '<div class="muted" style="text-align:center;padding:32px">该时段暂无热帖</div>'}
+        </div>
+      </div>
+    `);
+    setNav('trends');
+  }
+
+  function renderGuide() {
+    const sec = (id, icon, title, body) => `
+      <section class="guide-sec" id="g-${id}">
+        <h3>${icon} ${title}</h3>
+        <div class="guide-body">${body}</div>
+      </section>`;
+    renderPage(`
+      <div class="rank-card guide-page">
+        <h2>📖 新手教程</h2>
+        <p class="muted">欢迎来到 JM 社区！这篇教程按代码实际逻辑编写，看完 5 分钟，玩转社区不迷路。</p>
+        <div class="guide-toc">
+          <a href="#g-start">🚀 快速上手</a><a href="#g-post">✍️ 发帖指南</a><a href="#g-coins">🍗 鸡腿签到</a>
+          <a href="#g-level">📊 等级经验</a><a href="#g-company">🏢 公司避雷库</a><a href="#g-shop">🛒 积分商城</a>
+          <a href="#g-lucky">🎲 抽奖工具</a><a href="#g-pro">💡 进阶玩法</a><a href="#g-safe">⚠️ 交易安全</a><a href="#g-faq">❓ 常见问题</a>
+        </div>
+        ${sec('start', '🚀', '快速上手', `
+          <ol>
+            <li><b>注册</b>：点右上角「注册」，填用户名+密码即可；如果有朋友的<b>邀请码</b>，填上——朋友能得 20 鸡腿奖励，你也能更快融入。</li>
+            <li><b>登录后先签到</b>：首页点「签到」按钮，每天领 <b>3~5 个鸡腿</b> + 3 点经验，连续签到还有成就徽章。</li>
+            <li><b>逛逛板块</b>：顶部「板块」看全部分区，体育迷直接去体育专区（篮球/足球/电竞等 11 个板块）。</li>
+            <li><b>第一帖</b>：点「发帖」选对板块，标题写清楚，内容支持 Markdown。发完记得回来看看回复！</li>
+          </ol>`)}
+        ${sec('post', '✍️', '发帖指南', `
+          <ul>
+            <li><b>选对板块</b>：帖子发到对应板块才有人看；部分板块（如福利分享）会自动带入<b>发帖模板</b>，照着填就行。</li>
+            <li><b>前缀标签</b>：体育区发帖可加 [流言板][赛后][前瞻][战报][专栏][讨论][提问][分享][转会][投票] 等前缀，一眼看懂帖子类型。</li>
+            <li><b>Markdown</b>：支持 **加粗**、*斜体*、&#96;代码&#96;、代码块、引用、列表、链接、图片。注意代码块内容会被转义，贴代码很安全。</li>
+            <li><b>投票帖</b>：发帖时可添加投票选项，适合「二选一」「选最佳」类话题，投票结果实时统计。</li>
+            <li><b>阅读权限</b>：发帖时可设阅读等级（LV1~LV10），等级不够的用户打不开，适合发内部干货。</li>
+            <li><b>悬赏帖</b>：可设置鸡腿悬赏，最佳答案被采纳后悬赏自动发放。</li>
+            <li><b>编辑记录</b>：帖子编辑后会公示编辑历史，坦荡交流。</li>
+            <li><b>楼层直达</b>：每层楼的 #编号 可点击复制链接，分享给朋友直达该楼；「👁 只看楼主」一键过滤。</li>
+          </ul>`)}
+        ${sec('coins', '🍗', '鸡腿与签到', `
+          <ul>
+            <li><b>鸡腿</b>是社区积分：注册送 <b>10</b> 个，每日签到 <b>3~5</b> 个，被邀请注册、发悬赏被采纳都能赚。</li>
+            <li>鸡腿用途：积分商城买<b>头衔/徽章</b>、发<b>悬赏帖</b>、参与抽奖。</li>
+            <li>签到连续 <b>7 天 / 30 天</b>解锁成就，在「成就墙」查看你的收集进度。</li>
+            <li>排行榜有「鸡腿总榜」和「今日签到榜」，看看谁是鸡腿大户。</li>
+          </ul>`)}
+        ${sec('level', '📊', '等级与经验', `
+          <p>经验决定等级，等级解锁更多玩法（LV2+ 可生成邀请码、发帖可设更高阅读权限）：</p>
+          <ul>
+            <li>发帖 <b>+5</b> 经验 ／ 回复 <b>+2</b> ／ 每日签到 <b>+3</b> ／ 写公司评价 <b>+3</b> ／ 帖子被点赞 <b>+1</b></li>
+            <li>升级会收到站内通知，个人空间有 <b>📊 等级进度面板</b>：全等级轴 + 主题/回复/获赞/被收藏/签到天数/鸡腿六维数据，一目了然。</li>
+          </ul>
+          <table class="guide-table"><thead><tr><th>等级</th><th>称号</th><th>所需经验</th></tr></thead><tbody>
+          <tr><td>LV1</td><td>初来乍到</td><td>0</td></tr><tr><td>LV2</td><td>论坛新人</td><td>50</td></tr>
+          <tr><td>LV3</td><td>活跃会员</td><td>150</td></tr><tr><td>LV4</td><td>资深会员</td><td>300</td></tr>
+          <tr><td>LV5</td><td>论坛达人</td><td>500</td></tr><tr><td>LV6</td><td>论坛精英</td><td>800</td></tr>
+          <tr><td>LV7</td><td>论坛名士</td><td>1200</td></tr><tr><td>LV8</td><td>论坛大师</td><td>1800</td></tr>
+          <tr><td>LV9</td><td>论坛传奇</td><td>2600</td></tr><tr><td>LV10</td><td>社区之神</td><td>3600</td></tr>
+          </tbody></table>`)}
+        ${sec('company', '🏢', '公司避雷库（小白指南）', `
+          <p>社区接入了 <b>585 万家</b>全国公司数据 + 真实员工评价，找工作前先来查一查：</p>
+          <ul>
+            <li><b>🔍 查公司</b>：点「避雷库」，搜公司名。支持按省份筛选、按评价数/好评率排序。列表页远程数据会置顶显示本地已有评价的公司。</li>
+            <li><b>⭐ 写评价</b>：进公司详情页写评价（需登录），给分 + 写真实体验，<b>+3 经验</b>。你的评价会帮助下一个求职者。</li>
+            <li><b>➕ 添加公司</b>：搜不到？点「添加公司」手动录入，丰富库的同时也方便自己写评价。</li>
+            <li><b>📌 避雷清单</b>：看到可疑公司点「加入避雷清单」，在「我的避雷清单」统一管理，投简历前对照看一眼。</li>
+            <li><b>排序小技巧</b>：按「评价数」找讨论最多的，按「好评率」找口碑好的；差评多的公司点进去看具体评价内容再下结论。</li>
+          </ul>`)}
+        ${sec('shop', '🛒', '积分商城', `
+          <ul>
+            <li>用鸡腿兑换：<b>自定义头衔</b>（80，7 天）／<b>老司机</b>（300，永久）／<b>社区元老</b>（500，永久）／<b>退隐大佬</b>（800，永久）／<b>鸡汤大户徽章</b>（300）。</li>
+            <li>买过的头衔进入你的<b>头衔库存</b>，在个人空间随时切换佩戴哪个，不会丢失。</li>
+          </ul>`)}
+        ${sec('lucky', '🎲', '幸运抽奖 & 社区工具', `
+          <ul>
+            <li><b>幸运抽奖</b>：<a href="/lucky">/lucky</a> 发起抽奖（Fisher-Yates 洗牌 + 公开种子可复算，绝对公平）；帖子正文写 <b>[lucky:编号]</b> 可把抽奖卡片嵌入帖子，还能一键复制抽奖口号去拉人。</li>
+            <li><b>热点榜</b>：<a href="/trends">/trends</a> 看 24 小时 / 7 天 / 30 天热文，不错过大事。</li>
+            <li><b>RSS 订阅</b>：<a href="/rss.xml">/rss.xml</a>，用阅读器订阅社区更新。</li>
+            <li><b>管理公示</b>：<a href="/ruling">/ruling</a> 公开所有封禁/删帖/置顶/锁定记录，管理透明可查。</li>
+          </ul>`)}
+        ${sec('pro', '💡', '进阶玩法', `
+          <ul>
+            <li><b>表情回应</b>：帖子下方可点 ❤️😂😮😢👏🔥 快速表态，不用回帖也能参与。</li>
+            <li><b>书签提醒</b>：收藏帖子时点 ⏰ 设提醒（几小时后），到期自动发站内通知，追更连载帖神器。</li>
+            <li><b>邀请码</b>：LV2+ 用户在个人空间生成邀请码（默认 5 次），朋友用你的码注册你得 <b>20 鸡腿</b>。</li>
+            <li><b>慢速模式</b>：热帖可能开启 🐢 慢速模式，回帖有冷却间隔，理性讨论。</li>
+            <li><b>私信</b>：点用户头像进空间可发私信，右上角铃铛看通知（有人@你、回你帖都会提醒）。</li>
+            <li><b>用户小卡片</b>：鼠标悬停用户名 0.45 秒弹出小卡片，快速了解对方。</li>
+          </ul>`)}
+        ${sec('safe', '⚠️', '交易安全', `
+          <ul>
+            <li>社区<b>不担保</b>任何私下交易：买卖账号、代充、兼职收款等务必走正规平台。</li>
+            <li>不轻信「先款后货」、不点陌生链接、不透露验证码。被骗请保留证据并联系管理。</li>
+            <li>看到诈骗帖请举报，管理核实后会删帖封禁并公示在 /ruling。</li>
+          </ul>`)}
+        ${sec('faq', '❓', '常见问题', `
+          <ul>
+            <li><b>忘记密码？</b>目前请联系管理员重置。</li>
+            <li><b>帖子被删了？</b>去 <a href="/ruling">/ruling</a> 查管理记录，公示了原因；有异议可私信管理员申诉。</li>
+            <li><b>公司库相关问题</b>（搜不到公司、评价怎么写）→ 看上面「🏢 公司避雷库」一节。</li>
+            <li><b>鸡腿不够用？</b>每日签到 + 多发优质帖，优质内容被点赞也有经验加速升级。</li>
+            <li><b>页面显示异常？</b>先下拉刷新或清缓存重进，仍不行请截图反馈给管理员。</li>
+          </ul>`)}
+      </div>
+    `);
+    setNav('guide');
   }
 
   async function renderRank(tab) {
@@ -486,7 +902,26 @@
   }
 
   async function renderPost(slug) {
-    const [topic] = await Promise.all([api('/api/topics/' + encodeURIComponent(slug)), loadBoards()]);
+    let topic;
+    try {
+      [topic] = await Promise.all([api('/api/topics/' + encodeURIComponent(slug)), loadBoards()]);
+    } catch (e) {
+      /* 阅读等级不足 */
+      if (e.needLevel) {
+        const myLv = e.myLevel || 0;
+        renderPage(`<div class="card" style="text-align:center;padding:40px 20px;max-width:520px;margin:40px auto">
+          <div style="font-size:48px">🔒</div>
+          <h2 style="margin:12px 0 8px">该帖子需要 LV${e.needLevel} 及以上才能查看</h2>
+          <p class="muted" style="font-size:13px">${myLv ? `你当前等级：LV${myLv}，多发帖、回帖、签到可升级` : '登录后多发帖、回帖、签到可提升等级'}</p>
+          <div style="margin-top:16px;display:flex;gap:10px;justify-content:center">
+            ${myLv ? '' : '<a class="btn btn-primary" href="/login?next=' + encodeURIComponent(location.pathname) + '">登录</a>'}
+            <a class="btn btn-ghost" href="/">返回首页</a>
+          </div>
+        </div>`);
+        return;
+      }
+      throw e;
+    }
     const bd = topic.board;
     const op = topic.posts[0];
     const opAuthor = op.author;
@@ -500,6 +935,7 @@
           ${topic.price ? `<span class="price-tag">💰 ¥ ${topic.price}</span>` : ''}
           ${topic.bounty ? `<span class="price-tag bounty-tag">💰 悬赏 ${topic.bounty} 鸡腿</span>` : ''}
           ${topic.poll ? `<span class="badge badge-rec">🗳️ 投票</span>` : ''}
+          ${topic.slowMode ? `<span class="badge" style="background:#fef3c7;color:#b45309" title="每人每 ${topic.slowMode} 秒只能回复一次">🐢 慢速 ${topic.slowMode}s</span>` : ''}
           ${(topic.tags || []).map(t => `<a class="tag-chip tag-link" href="/tag/${encodeURIComponent(t)}">${esc(t)}</a>`).join('')}
         </div>
         <h1>${esc(topic.title)}</h1>
@@ -556,7 +992,7 @@
           <div class="post-actions">
             <button class="like-btn ${p.likedByMe ? 'liked' : ''}" data-likes="${p.likeCount}" data-liked="${p.likedByMe ? 1 : 0}">👍 <span>${fmtNum(p.likeCount)}</span></button>
             ${state.user && p.author.id !== state.user.id ? `<button class="tip-btn" data-post="${esc(p.id)}" data-author="${esc(p.author.name)}">🍗 打赏</button>` : ''}
-            ${idx === 0 && state.user ? `<button class="fav-btn ${topic.favorited ? 'fav-on' : ''}" id="favBtn">${topic.favorited ? '★ 已收藏' : '☆ 收藏'}</button>` : ''}
+            ${idx === 0 && state.user ? `<button class="fav-btn ${topic.favorited ? 'fav-on' : ''}" id="favBtn">${topic.favorited ? '★ 已收藏' : '☆ 收藏'}</button>${topic.favorited ? `<button class="fav-btn" id="remindBtn" title="设置回看提醒">⏰ 提醒</button>` : ''}` : ''}
             <button class="copy-link">🔗 分享</button>
             ${idx > 0 ? `<button class="quote-btn" data-author="${esc(p.author.name)}" data-q="${encodeURIComponent(p.content)}">💬 引用</button>` : ''}
             ${topic.bounty && idx > 0 && state.user && (state.user.id === topic.userId || isStaff(state.user))
@@ -566,6 +1002,10 @@
               ? `<span class="post-actions-sep"></span><a class="edit-btn" href="/compose?edit=${esc(topic.id)}">✏️ 编辑</a><button class="del-btn" data-id="${esc(topic.id)}">🗑️ 删除</button>`
               : ''}
           </div>
+          ${idx === 0 ? `<div class="react-row">${['❤️','😂','😮','😢','👏','🔥'].map(e => {
+            const st = (topic.reactions || {})[e] || { count: 0, mine: false };
+            return `<button class="react-btn ${st.mine ? 'on' : ''}" data-emoji="${e}" title="回应">${e}<span>${st.count || ''}</span></button>`;
+          }).join('')}</div>` : ''}
         </div>
       </div>`).join('');
 
@@ -607,6 +1047,9 @@
       } catch (e) { document.getElementById('replyError').textContent = e.message; }
     });
 
+    /* 移动端底部评论条（虎扑 App 式） */
+    setupMobileCommentBar(topic);
+
     // like（乐观更新：先改 UI，失败回滚）
     document.querySelectorAll('.like-btn').forEach(btn => {
       btn.addEventListener('click', async () => {
@@ -635,6 +1078,28 @@
         }
       });
     });
+    // 表情回应
+    document.querySelectorAll('.react-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!state.user) { toast('请先登录', 'err'); route('/login?next=' + encodeURIComponent(location.pathname + location.search)); return; }
+        const emoji = btn.dataset.emoji;
+        const wasOn = btn.classList.contains('on');
+        const span = btn.querySelector('span');
+        const oldN = parseInt(span.textContent) || 0;
+        btn.classList.toggle('on', !wasOn);
+        span.textContent = wasOn ? (oldN - 1 || '') : oldN + 1;
+        try {
+          const r = await api(`/api/topics/${topic.id}/react`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emoji }) });
+          const st = r.stats[emoji];
+          btn.classList.toggle('on', !!st.mine);
+          span.textContent = st.count || '';
+        } catch (e) {
+          btn.classList.toggle('on', wasOn);
+          span.textContent = oldN || '';
+          toast(e.message, 'err');
+        }
+      });
+    });
     // favorite（乐观更新）
     const fav = document.getElementById('favBtn');
     if (fav) fav.addEventListener('click', async () => {
@@ -650,6 +1115,23 @@
         fav.textContent = wasOn ? '★ 已收藏' : '☆ 收藏';
         toast(e.message, 'err');
       }
+    });
+    // 书签提醒
+    const rmdBtn = document.getElementById('remindBtn');
+    if (rmdBtn) rmdBtn.addEventListener('click', async () => {
+      const v = prompt('什么时候提醒你回看？输入小时数（1-720），取消则留空后点"取消提醒"：\n如：24 = 1天后', '24');
+      try {
+        if (v === null) return;
+        const hours = parseFloat(v);
+        let at = null;
+        if (v.trim() === '') { /* 取消 */ }
+        else {
+          if (!hours || hours < 1 || hours > 720) { toast('请输入 1-720 之间的小时数', 'err'); return; }
+          at = new Date(Date.now() + hours * 3600000).toISOString();
+        }
+        await api(`/api/topics/${topic.id}/reminder`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ at }) });
+        toast(at ? `已设置，${v} 小时后提醒你` : '已取消提醒');
+      } catch (e) { toast(e.message, 'err'); }
     });
     // copy link（带降级）
     document.querySelectorAll('.copy-link').forEach(b => {
@@ -818,6 +1300,10 @@
             <label>预览效果</label>
             <div class="card" style="padding:14px;min-height:80px;margin-top:6px" id="cPreview"></div>
           </div>
+          <div class="form-group" id="anonGroup" style="display:none">
+            <label style="display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer"><input type="checkbox" id="cAnonymous"> 🌳 匿名投稿（不显示我的名字）</label>
+            <div class="help-text">电报树洞：投稿先由管理员审核，通过后同步到电报频道和论坛；带电报链接的内容会被过滤。</div>
+          </div>
           <div class="form-group" id="priceGroup" style="display:none">
             <label>售价（元，仅交易板块）</label>
             <input type="number" class="form-control" id="cPrice" min="0" placeholder="0" value="${t && t.price ? esc(t.price) : ''}" />
@@ -825,6 +1311,12 @@
           <div class="form-group">
             <label>💰 悬赏（鸡腿） <span class="muted" style="font-weight:400;font-size:12px">发布悬赏帖，采纳答案后发放给回答者；当前余额：🍗 ${state.user.coins || 0}</span></label>
             <input type="number" class="form-control" id="cBounty" min="0" max="${state.user.coins || 0}" placeholder="0 = 普通帖；填 10+ 即悬赏帖" value="${t && t.bounty ? esc(t.bounty) : ''}" />
+          </div>
+          <div class="form-group">
+            <label>🔒 阅读权限 <span class="muted" style="font-weight:400;font-size:12px">只有达到该等级的用户才能看这篇帖子</span></label>
+            <select class="form-control" id="cMinLevel">
+              ${[1,2,3,4,5,6,7,8,9,10].map(lv => `<option value="${lv}" ${t && (t.minLevel||1) === lv ? 'selected' : ''}>${lv === 1 ? '所有人可见' : 'LV' + lv + ' 及以上可见'}</option>`).join('')}
+            </select>
           </div>
           <div class="form-group">
             <label>🗳️ 投票 <span class="muted" style="font-weight:400;font-size:12px">可选：为帖子附加一个投票（2-10 个选项，每行一个）</span></label>
@@ -863,9 +1355,20 @@
     const togglePrice = () => {
       const b = state.boards.find(x => x.id === bSel.value);
       pg.style.display = (b && b.slug === 'trade') ? 'block' : 'none';
+      const ag = document.getElementById('anonGroup');
+      if (ag) ag.style.display = (b && b.slug === 'tg-treehole') ? 'block' : 'none';
     };
     bSel.addEventListener('change', togglePrice);
     togglePrice();
+    /* 话题模板：新帖且内容为空时按板块模板预填 */
+    const cContent = document.getElementById('cContent');
+    const applyTemplate = () => {
+      if (editId || cContent.value.trim()) return;
+      const b = state.boards.find(x => x.id === bSel.value);
+      if (b && b.topicTemplate) { cContent.value = b.topicTemplate; toast('已按板块模板预填内容'); }
+    };
+    bSel.addEventListener('change', applyTemplate);
+    applyTemplate();
 
     document.getElementById('composeForm').addEventListener('submit', async e => {
       e.preventDefault();
@@ -875,6 +1378,7 @@
       const tags = document.getElementById('cTags').value.trim().split(/\s+/).filter(Boolean).slice(0, 5);
       const price = document.getElementById('cPrice').value;
       const bounty = Math.floor(Number(document.getElementById('cBounty').value) || 0);
+      const minLevel = Math.max(1, Math.min(10, parseInt(document.getElementById('cMinLevel').value) || 1));
       /* 投票参数 */
       const pollQ = document.getElementById('cPollQ').value.trim();
       const pollOpts = document.getElementById('cPollOpts').value.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 10);
@@ -884,11 +1388,13 @@
       if (bounty > (state.user.coins || 0)) { document.getElementById('formError').textContent = '悬赏鸡腿超出你的余额'; return; }
       try {
         if (t) {
-          const r = await api('/api/topics/' + t.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, boardId, content, tags, price }) });
+          const r = await api('/api/topics/' + t.id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, boardId, content, tags, price, minLevel }) });
           route('/post/' + r.slug);
         } else {
-          const nt = await api('/api/topics', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, boardId, content, tags, price, bounty, poll }) });
-          route('/post/' + nt.slug);
+          const anonymous = !!(document.getElementById('cAnonymous') && document.getElementById('cAnonymous').checked);
+          const nt = await api('/api/topics', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, boardId, content, tags, price, bounty, poll, minLevel, anonymous }) });
+          if (nt.status === 'pending') { toast('已提交，等待管理员审核，通过后会同步到电报频道'); route('/boards?board=tg-treehole'); }
+          else route('/post/' + nt.slug);
         }
       } catch (err) { document.getElementById('formError').textContent = err.message; }
     });
@@ -930,12 +1436,12 @@
     renderPage(`
       <div class="card auth-card">
         <h2>🚀 加入社区</h2>
-        <div class="help-text" style="margin-bottom:14px;padding:10px 12px;background:var(--soft);border-radius:10px">🔑 本社区采用邀请注册制，需要管理员发放的<strong>注册码</strong>才能注册。还没有注册码？联系社区管理员获取。</div>
+        <div class="help-text" style="margin-bottom:14px;padding:10px 12px;background:var(--soft);border-radius:10px">🔑 本社区采用邀请注册制，需要<strong>邀请码</strong>才能注册。还没有邀请码？找社区老用户要一个吧～</div>
         <form id="registerForm">
           <div class="form-group"><label>用户名</label><input type="text" class="form-control" id="rUsername" required maxlength="20" /></div>
           <div class="form-group"><label>昵称</label><input type="text" class="form-control" id="rName" maxlength="20" /></div>
           <div class="form-group"><label>邮箱</label><input type="email" class="form-control" id="rEmail" required /></div>
-          <div class="form-group"><label>注册码</label><input type="text" class="form-control" id="rCode" required placeholder="JM-XXXXXXXX" style="text-transform:uppercase" /></div>
+          <div class="form-group"><label>邀请码</label><input type="text" class="form-control" id="rCode" required placeholder="JM-XXXXXXXX" style="text-transform:uppercase" /></div>
           <div class="form-group"><label>密码</label><input type="password" class="form-control" id="rPassword" required minlength="6" /></div>
           <button type="submit" class="btn btn-primary btn-block">注 册</button>
           <div class="error" id="formError"></div>
@@ -968,6 +1474,12 @@
       try { achList = await api('/api/achievements'); } catch (e) { achList = null; }
     }
     const mineAch = isMe && achList ? achList.filter(a => a.unlocked) : ((user.achievements || []).map(id => ({ id })));
+    /* 我的邀请（仅本人） */
+    let myInvites = null;
+    if (isMe && (user.level || 1) >= 2) { try { myInvites = await api('/api/invites/mine'); } catch (e) { myInvites = null; } }
+    /* 等级进度（linux.do 式面板） */
+    let lvProg = null;
+    try { lvProg = await api('/api/users/' + encodeURIComponent(username) + '/level-progress'); } catch (e) { lvProg = null; }
     const achUnlocked = achList ? achList.filter(a => a.unlocked).length : (user.achievements || []).length;
     renderPage(`
       <div class="space-head">
@@ -977,6 +1489,10 @@
           <p class="muted">${user.role === 'owner' ? '社区站长' : user.role === 'admin' ? '社区管理员' : '社区成员'}${roleTag(user)} · Lv.${user.level || 1} ${esc(user.levelTitle || '')} · ${(user.exp || 0).toLocaleString()} 经验 · ${new Date(user.joinedAt).toLocaleDateString('zh-CN')} 加入</p>
           ${expBar(user)}
           ${badgeRow(user)}
+          ${isMe && (user.titles || []).length > 1 ? `<div style="margin-top:8px;font-size:13px"><span class="muted">🏷️ 佩戴头衔：</span><select id="wearTitleSel" class="form-control" style="display:inline-block;width:auto;padding:4px 8px;font-size:13px">
+            <option value="">（不佩戴）</option>
+            ${(user.titles || []).map(t => `<option value="${esc(t)}" ${user.title === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}
+          </select></div>` : ''}
           <div class="space-stats">
             <div><strong>${user.topicCount}</strong><span>主题</span></div>
             <div><strong>${user.replyCount}</strong><span>回复</span></div>
@@ -986,6 +1502,12 @@
             <div><strong>🏅 ${achUnlocked || 0}</strong><span>成就</span></div>
             <div><strong>${user.checkinCount || 0}</strong><span>签到天数</span></div>
           </div>
+          ${lvProg ? `<div class="lvprog">
+            <div class="lvprog-head"><span>📊 等级进度</span><span class="muted">Lv.${lvProg.level} ${esc(lvProg.levelTitle)}${lvProg.nextExp ? ` → Lv.${lvProg.level + 1} ${esc(lvProg.nextTitle)}` : '（满级）'}</span></div>
+            <div class="lvprog-bar"><div style="width:${lvProg.progress}%"></div></div>
+            <div class="lvprog-levels">${lvProg.levels.map(L => `<span class="${L.lv <= lvProg.level ? 'done' : ''} ${L.lv === lvProg.level ? 'cur' : ''}" title="${esc(L.title)}（${L.exp}经验）">Lv.${L.lv}</span>`).join('')}</div>
+            <div class="lvprog-stats">${lvProg.stats.map(x => `<div><strong>${x.value}</strong><span>${x.icon} ${x.label}</span></div>`).join('')}</div>
+          </div>` : ''}
           ${contacts.length ? `<div style="margin-top:10px;display:flex;gap:12px;flex-wrap:wrap;font-size:13px">${contacts.join('')}</div>` : ''}
           ${user.bio ? `<div class="space-bio">${esc(user.bio)}</div>` : ''}
           <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
@@ -993,6 +1515,13 @@
           </div>
         </div>
       </div>
+      ${myInvites ? `<div class="space-ach" id="invites"><h3>🎁 我的邀请 <span class="muted" style="font-size:12px">已邀请 ${myInvites.totalInvited} 人 · 每成功邀请 1 人得 20 🍗</span></h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+          ${myInvites.codes.map(c => `<div class="invite-code-card"><code>${esc(c.code)}</code><span class="muted">${c.usedCount}/${c.maxUses} 已用</span><button class="btn btn-xs btn-outline" data-copy="${esc(c.code)}">复制</button></div>`).join('')}
+        </div>
+        <button class="btn btn-sm btn-primary" id="genInviteBtn">＋ 生成邀请码（默认 5 次）</button>
+        ${myInvites.codes.some(c => c.invited.length) ? `<div style="margin-top:8px;font-size:13px" class="muted">已邀请：${myInvites.codes.flatMap(c => c.invited).map(u => esc(u.name || u.username)).join('、')}</div>` : ''}
+      </div>` : ''}
       ${mineAch.length ? `<div class="space-ach"><h3>🏅 成就</h3><div class="ach-strip">${mineAch.map(a => {
         const meta = achList ? achList.find(x => x.id === a.id) : null;
         return meta ? `<span class="ach-mini" title="${esc(meta.name)}：${esc(meta.desc)}">${esc(meta.icon)}</span>` : '';
@@ -1004,6 +1533,28 @@
       ${sectionTitle(isMe ? '我发布的主题' : 'TA 发布的主题', user.topicCount + ' 个')}
       ${postListHtml(user.topics || [])}
     `);
+    /* 邀请码：生成 + 复制 */
+    const genBtn = document.getElementById('genInviteBtn');
+    if (genBtn) genBtn.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/invites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+        toast('邀请码已生成：' + r.code);
+        renderSpace(username);
+      } catch (e) { toast(e.message, 'err'); }
+    });
+    document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', () => {
+      navigator.clipboard.writeText(b.dataset.copy).then(() => toast('邀请码已复制')).catch(() => toast('复制失败', 'err'));
+    }));
+    /* 切换佩戴头衔 */
+    const wearSel = document.getElementById('wearTitleSel');
+    if (wearSel) wearSel.addEventListener('change', async () => {
+      try {
+        const url = wearSel.value ? '/api/shop/wear-title' : '/api/shop/unwear-title';
+        await api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: wearSel.value }) });
+        toast(wearSel.value ? '已佩戴「' + wearSel.value + '」' : '已卸下头衔');
+        renderSpace(username);
+      } catch (e) { toast(e.message, 'err'); }
+    });
     /* 转鸡腿 */
     const trBtn = document.getElementById('transferBtn');
     if (trBtn) trBtn.addEventListener('click', async () => {
@@ -1116,14 +1667,22 @@
     document.getElementById('chatBody').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
   }
 
-  async function renderTag(name) {
-    const topics = await api('/api/tag/' + encodeURIComponent(name));
-    renderPage(`${sectionTitle('🏷️ 标签：' + name, topics.length + ' 个帖子')}${postListHtml(topics)}`);
+  async function renderTag(name, page = 1) {
+    const data = await api('/api/tag/' + encodeURIComponent(name) + '?page=' + page + '&pageSize=30');
+    const topics = data.list || [];
+    const pages = data.pages || 1;
+    const urlFn = (p) => '/tag/' + encodeURIComponent(name) + (p > 1 ? '?page=' + p : '');
+    renderPage(`
+      ${sectionTitle('🏷️ 标签：' + name, (data.total || 0) + ' 个帖子')}
+      ${pages > 1 ? `<div style="display:flex;justify-content:flex-end;margin:2px 2px 10px">${pager(data.page || 1, pages, urlFn, true)}</div>` : ''}
+      ${postListHtml(topics)}
+      ${pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(data.page || 1, pages, urlFn)}</div>` : ''}
+    `);
   }
 
   /* ---------- 公司避雷库 ---------- */
   /* 通用分页条：cur 当前页、pages 总页数、urlFn 页码→链接 */
-  function pager(cur, pages, urlFn) {
+  function pager(cur, pages, urlFn, compact) {
     if (pages <= 1) return '';
     const show = new Set([1, pages]);
     for (let i = cur - 2; i <= cur + 2; i++) if (i >= 1 && i <= pages) show.add(i);
@@ -1134,7 +1693,7 @@
       html += `<a class="pager-num ${p === cur ? 'on' : ''}" href="${urlFn(p)}">${p}</a>`;
       prev = p;
     });
-    return `<div class="pager">${cur > 1 ? `<a class="pager-btn" href="${urlFn(cur - 1)}">‹ 上一页</a>` : ''}${html}${cur < pages ? `<a class="pager-btn" href="${urlFn(cur + 1)}">下一页 ›</a>` : ''}</div>`;
+    return `<div class="pager${compact ? ' pager-compact' : ''}">${cur > 1 ? `<a class="pager-btn" href="${urlFn(cur - 1)}">‹ 上一页</a>` : ''}${html}${cur < pages ? `<a class="pager-btn" href="${urlFn(cur + 1)}">下一页 ›</a>` : ''}</div>`;
   }
 
   /* ================= 公司避雷库 v9：全国百万级 ================= */
@@ -1358,17 +1917,11 @@
           <button class="btn btn-primary btn-sm" id="rateSubmit">${my ? '更新评价' : '提交避雷'}</button>
         </div>
       </div>` : `
-      <div class="card" style="margin-bottom:14px">
-        <div class="section-title" style="margin-top:0">⭐ 我来打分避雷（访客评价）</div>
-        <div style="display:flex;gap:6px" id="rateStars">
-          ${[1, 2, 3, 4, 5].map(i => `<span class="rate-star" data-v="${i}" style="font-size:28px;cursor:pointer;color:#d8e2da">★</span>`).join('')}
-        </div>
-        <input type="text" class="form-control" id="rateNick" maxlength="20" placeholder="你的昵称（不填则显示"匿名访客"）" style="margin-top:10px">
-        <textarea id="rateContent" class="form-control" rows="3" maxlength="500" placeholder="写写你的真实经历：薪资、加班、裁员、欠薪、坑在哪...（至少一句话）" style="margin-top:10px"></textarea>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
-          <span class="muted" style="font-size:12px">🔒 访客评价将匿名展示，<a href="/login?next=${encodeURIComponent('/companies/' + c.id)}">登录</a>可获经验值</span>
-          <button class="btn btn-primary btn-sm" id="rateSubmit">提交避雷</button>
-        </div>
+      <div class="card" style="margin-bottom:14px;text-align:center;padding:28px 16px">
+        <div style="font-size:40px">🔒</div>
+        <h3 style="margin:10px 0 6px">登录后才能打分避雷</h3>
+        <p class="muted" style="font-size:13px;margin:0 0 14px">写评价、看全部评价都需要登录，保证评价真实可信</p>
+        <a class="btn btn-primary" href="/login?next=${encodeURIComponent('/companies/' + c.id)}">登录 / 注册</a>
       </div>`}
       <div class="card" style="padding:0;overflow:hidden">
         <div class="section-title" style="padding:12px 16px;margin:0;border-bottom:1px solid var(--border)">💬 全部评价（${c.reviewCount}）</div>
@@ -1583,7 +2136,7 @@
       </div>
       <div class="card" style="margin-bottom:14px">
         <h3>❓ 常见问题 FAQ</h3>
-        <details open><summary><strong>如何注册账号？</strong></summary><p style="padding:8px 0">本社区采用邀请注册制，需要管理员发放的注册码才能注册。请联系社区管理员获取注册码。</p></details>
+        <details open><summary><strong>如何注册账号？</strong></summary><p style="padding:8px 0">本社区采用邀请注册制，需要邀请码才能注册。找社区老用户（LV2+）要一个邀请码即可，邀请人还能得鸡腿奖励。</p></details>
         <details><summary><strong>鸡腿有什么用？</strong></summary><p style="padding:8px 0">鸡腿是社区货币，可通过签到、发帖、回帖获取。用途包括：打赏优质帖子、发布悬赏、积分商城兑换徽章和头衔、用户间转账。</p></details>
         <details><summary><strong>如何提升等级？</strong></summary><p style="padding:8px 0">发帖(+5经验)、回帖(+2)、签到(+3)、评价公司(+3)、被点赞(+1)。等级从"初来乍到"到"社区之神"共 10 级。</p></details>
         <details><summary><strong>公司避雷库的数据来源？</strong></summary><p style="padding:8px 0">数据来源于全国工商注册公开信息（1978-2019年），涵盖 31 个省份 580 万+ 家企业。所有访客均可添加公司或发表评价，评价将匿名展示并自动保存。</p></details>
@@ -1640,6 +2193,7 @@
     const menuItems = [
       { id: 'profile', icon: '👤', label: '个人资料' },
       { id: '2fa', icon: '🔐', label: '双因素验证' },
+      { id: 'security', icon: '🔑', label: '账号安全' },
       { id: 'contacts', icon: '📇', label: '联系方式' },
       { id: 'blocked', icon: '🚫', label: '屏蔽用户' },
       { id: 'preferences', icon: '⚙️', label: '常用偏好' },
@@ -1701,6 +2255,16 @@
             <p class="muted" style="font-size:13px">开启 2FA 后，登录时除了密码还需要输入动态验证码，显著提升账号安全性。</p>
             <button class="btn btn-primary" style="margin-top:14px" id="enable2fa">启用双因素验证</button>
           </div>
+        </div>`,
+
+      security: `
+        <div class="settings-section ${section === 'security' ? 'active' : ''}" data-section="security">
+          <h2>账号安全</h2>
+          <div class="form-group"><label>当前密码</label><input type="password" class="form-control" id="sCurPw" autocomplete="current-password" placeholder="输入当前密码"></div>
+          <div class="form-group"><label>新密码（至少 6 位）</label><input type="password" class="form-control" id="sNewPw" autocomplete="new-password" placeholder="输入新密码"></div>
+          <div class="form-group"><label>再输一次新密码</label><input type="password" class="form-control" id="sNewPw2" autocomplete="new-password" placeholder="确认新密码"></div>
+          <p class="muted" style="font-size:13px">修改成功后，其他设备会自动退出登录，本设备保持登录。</p>
+          <div class="settings-footer"><span class="settings-msg" id="sMsg"></span><button class="btn btn-primary" id="changePwBtn">修改密码</button></div>
         </div>`,
 
       contacts: `
@@ -1865,6 +2429,24 @@
           wechat: document.getElementById('sWechat').value,
         }
       }));
+    }
+
+    if (section === 'security') {
+      document.getElementById('changePwBtn').addEventListener('click', async () => {
+        const cur = document.getElementById('sCurPw').value;
+        const nw = document.getElementById('sNewPw').value;
+        const nw2 = document.getElementById('sNewPw2').value;
+        if (!cur || !nw) { showMsg('请填写当前密码和新密码', false); return; }
+        if (nw.length < 6) { showMsg('新密码至少 6 位', false); return; }
+        if (nw !== nw2) { showMsg('两次输入的新密码不一致', false); return; }
+        try {
+          const r = await api('/api/auth/change-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentPassword: cur, newPassword: nw }) });
+          document.getElementById('sCurPw').value = '';
+          document.getElementById('sNewPw').value = '';
+          document.getElementById('sNewPw2').value = '';
+          showMsg(r.kicked ? `密码已修改，其他 ${r.kicked} 台设备已退出登录` : '密码已修改', true);
+        } catch (e) { showMsg(e.message, false); }
+      });
     }
 
     if (section === 'blocked') {
@@ -2051,11 +2633,11 @@
             ${list.map(c => `
               <tr data-id="${esc(c.id)}">
                 <td><a href="/companies/${esc(c.id)}" target="_blank">${esc(c.name)}</a>${c.source === 'extra' ? ' <span class="tag tag-orange">新增</span>' : ''}</td>
-                <td class="muted">${esc(c.industry)}</td>
-                <td class="muted">${esc(c.region)}</td>
-                <td>${companyBadge(c)} ${c.avg ? `<span class="muted">${c.avg.toFixed(1)}</span>` : ''}</td>
-                <td class="muted">${c.reviewCount}</td>
-                <td style="text-align:right;white-space:nowrap">
+                <td data-label="行业" class="muted">${esc(c.industry)}</td>
+                <td data-label="区域" class="muted">${esc(c.region)}</td>
+                <td data-label="避雷指数">${companyBadge(c)} ${c.avg ? `<span class="muted">${c.avg.toFixed(1)}</span>` : ''}</td>
+                <td data-label="评价数" class="muted">${c.reviewCount}</td>
+                <td class="act-cell">
                   <button class="btn btn-sm btn-ghost act-ed" data-id="${esc(c.id)}">编辑</button>
                   <button class="btn btn-sm btn-danger act-del" data-id="${esc(c.id)}">删除</button>
                 </td>
@@ -2183,6 +2765,10 @@
       if (u.role === 'user') return `<button class="btn btn-sm btn-ghost act-role" data-id="${esc(u.id)}" data-role="admin">升管理员</button>`;
       return '';
     };
+    const lvlBtn = u => {
+      if (!meOwner || u.id === me.id) return '';
+      return `<button class="btn btn-sm btn-ghost act-level" data-id="${esc(u.id)}">⬆️ 升级</button>`;
+    };
     const dangerBtns = u => {
       if (u.id === me.id) return '';
       const canBan = meOwner ? u.role !== 'owner' : u.role === 'user';
@@ -2213,22 +2799,24 @@
       <div class="card" style="padding:0;overflow:hidden">
         <div class="admin-table-wrap">
         <table class="admin-table">
-          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th>鸡腿</th><th>主题/回复</th><th>注册时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+          <thead><tr><th>用户</th><th>邮箱</th><th>角色</th><th>等级</th><th>鸡腿</th><th>主题/回复</th><th>注册时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
           <tbody>
             ${users.map(u => `
               <tr data-id="${esc(u.id)}">
-                <td><a class="rank-user" href="/space/${esc(u.username)}"><img src="${esc(avatar(u))}" alt="">${esc(u.name)} <span class="muted">@${esc(u.username)}</span></a></td>
-                <td class="muted">${esc(u.email || '-')}</td>
-                <td><span class="role-badge ${u.role === 'owner' ? 'owner' : u.role === 'admin' ? 'admin' : ''}">${u.role === 'owner' ? '👑 站长' : u.role === 'admin' ? '管理员' : '成员'}</span></td>
-                <td><span class="coins">🍗 ${u.coins || 0}</span></td>
-                <td class="muted">${u.topicCount} / ${u.replyCount}</td>
-                <td class="muted">${new Date(u.createdAt).toLocaleDateString('zh-CN')}</td>
-                <td>${u.banned ? '<span class="role-badge banned">已封禁</span>' : '<span class="role-badge ok">正常</span>'}</td>
-                <td style="text-align:right;white-space:nowrap">
+                <td><a class="rank-user" href="/space/${esc(u.username)}"><img src="${esc(avatar(u))}" alt=""><span class="u-name">${esc(u.name)}</span> <span class="muted">@${esc(u.username)}</span></a></td>
+                <td data-label="邮箱" class="muted u-email">${esc(u.email || '-')}</td>
+                <td data-label="角色"><span class="role-badge ${u.role === 'owner' ? 'owner' : u.role === 'admin' ? 'admin' : ''}">${u.role === 'owner' ? '👑 站长' : u.role === 'admin' ? '管理员' : '成员'}</span></td>
+                <td data-label="等级"><span class="lv-badge">LV${u.level || 1}</span> <span class="muted" style="font-size:12px;white-space:nowrap">${esc(u.levelTitle || '')}</span></td>
+                <td data-label="鸡腿"><span class="coins">🍗 ${u.coins || 0}</span></td>
+                <td data-label="主题/回复" class="muted" style="white-space:nowrap">${u.topicCount} / ${u.replyCount}</td>
+                <td data-label="注册时间" class="muted" style="white-space:nowrap">${new Date(u.createdAt).toLocaleDateString('zh-CN')}</td>
+                <td data-label="状态">${u.banned ? '<span class="role-badge banned">已封禁</span>' : '<span class="role-badge ok">正常</span>'}</td>
+                <td class="act-cell">
+                  ${lvlBtn(u)}
                   ${roleBtns(u)}
                   ${dangerBtns(u)}
                 </td>
-              </tr>`).join('') || `<tr><td colspan="8" class="muted" style="text-align:center;padding:30px">没有找到用户</td></tr>`}
+              </tr>`).join('') || `<tr><td colspan="9" class="muted" style="text-align:center;padding:30px">没有找到用户</td></tr>`}
           </tbody>
         </table>
         </div>
@@ -2248,6 +2836,36 @@
       const msgs = { owner: '⚠️ 确认将该用户设为「站长」？站长拥有最高管理权限，可管理所有用户！', admin: '确认将该用户设为管理员？', user: '确认取消该用户的管理员/站长身份，降为普通成员？' };
       if (!confirm(msgs[role] || '')) return;
       try { await api('/api/admin/users/' + b.dataset.id + '/role', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) }); await adminUsers(main); } catch (e) { alert(e.message); }
+    }));
+    /* 站长调等级：弹出 LV1-10 选择（与服务端 LEVELS 称号/经验门槛一致） */
+    const LV_META = [[1, '初来乍到', 0], [2, '论坛新人', 50], [3, '活跃会员', 150], [4, '资深会员', 300], [5, '论坛达人', 500], [6, '论坛精英', 800], [7, '论坛名士', 1200], [8, '论坛大师', 1800], [9, '论坛传奇', 2600], [10, '社区之神', 3600]];
+    const openLevelPicker = u => {
+      document.querySelectorAll('.lv-overlay').forEach(e => e.remove());
+      const ov = document.createElement('div');
+      ov.className = 'lv-overlay';
+      ov.innerHTML = `<div class="lv-modal">
+        <div class="lv-modal-head"><b>调整 ${esc(u.name)} 的等级</b><button class="lv-close" aria-label="关闭">✕</button></div>
+        <p class="muted" style="font-size:12.5px;margin:0 0 10px">当前 LV${u.level || 1} · ${esc(u.levelTitle || '')}（经验 ${u.exp || 0}）。点目标等级确认后立即生效，用户会收到升级通知。</p>
+        <div class="lv-grid">${LV_META.map(([lv, t, e]) => `<button class="lv-opt ${lv === (u.level || 1) ? 'cur' : ''}" data-lv="${lv}"><b>LV${lv}</b><span>${t}</span><small>${e} 经验</small></button>`).join('')}</div>
+      </div>`;
+      document.body.appendChild(ov);
+      const close = () => ov.remove();
+      ov.addEventListener('click', e => { if (e.target === ov) close(); });
+      ov.querySelector('.lv-close').addEventListener('click', close);
+      ov.querySelectorAll('.lv-opt').forEach(b => b.addEventListener('click', async () => {
+        const lv = parseInt(b.dataset.lv, 10);
+        if (lv === (u.level || 1)) { close(); return; }
+        if (!confirm(`确认把 ${u.name}（@${u.username}）的等级设为 LV${lv}？`)) return;
+        try {
+          await api('/api/admin/users/' + u.id + '/level', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ level: lv }) });
+          close();
+          await adminUsers(main);
+        } catch (e) { alert(e.message); }
+      }));
+    };
+    main.querySelectorAll('.act-level').forEach(b => b.addEventListener('click', () => {
+      const u = users.find(x => x.id === b.dataset.id);
+      if (u) openLevelPicker(u);
     }));
     main.querySelectorAll('.act-ban').forEach(b => b.addEventListener('click', async () => {
       if (!confirm('确认封禁该用户？封禁后其将无法登录。')) return;
@@ -2286,17 +2904,18 @@
         <a href="/admin/reports?status=dismissed" class="${status === 'dismissed' ? 'active' : ''}">已驳回</a>
       </div>
       <div class="card" style="padding:0;overflow:hidden">
+        <div class="admin-table-wrap">
         <table class="admin-table">
           <thead><tr><th>类型</th><th>举报对象</th><th>理由</th><th>举报人</th><th>时间</th><th style="text-align:right">操作</th></tr></thead>
           <tbody>
             ${list.map(r => `
               <tr>
-                <td>${typeName[r.type] || r.type}</td>
+                <td data-label="类型">${typeName[r.type] || r.type}</td>
                 <td>${r.type === 'topic' ? `<a href="/post/${esc(r.targetSlug || '')}">${esc(r.targetTitle)}</a>` : esc(r.targetTitle)}</td>
-                <td class="muted" style="max-width:260px">${esc(r.reason)}</td>
-                <td>${esc(r.reporterName)}</td>
-                <td class="muted">${fmtTime(r.createdAt)}</td>
-                <td style="text-align:right;white-space:nowrap">
+                <td data-label="理由" class="muted" style="max-width:260px">${esc(r.reason)}</td>
+                <td data-label="举报人">${esc(r.reporterName)}</td>
+                <td data-label="时间" class="muted">${fmtTime(r.createdAt)}</td>
+                <td class="act-cell">
                   ${status === 'open' ? `
                     <button class="btn btn-sm btn-success act-rs" data-id="${esc(r.id)}" data-status="resolved">已处理</button>
                     <button class="btn btn-sm btn-ghost act-rs" data-id="${esc(r.id)}" data-status="dismissed">驳回</button>` : `<span class="muted">${esc(r.handledBy || '')} · ${r.handledAt ? fmtTime(r.handledAt) : ''}</span>`}
@@ -2304,6 +2923,7 @@
               </tr>`).join('') || `<tr><td colspan="6" class="muted" style="text-align:center;padding:30px">暂无举报</td></tr>`}
           </tbody>
         </table>
+        </div>
         ${pager(page, pages, p => buildUrl({ page: p }))}
       </div>`;
     main.querySelectorAll('.act-rs').forEach(b => b.addEventListener('click', async () => {
@@ -2446,11 +3066,11 @@
             ${data.codes.map(c => `
               <tr data-id="${esc(c.id)}">
                 <td><code class="code-chip">${esc(c.code)}</code></td>
-                <td class="muted">${esc(c.note || '-')}</td>
-                <td>${c.usedBy ? '<span class="role-badge banned">已使用</span>' : '<span class="role-badge ok">未使用</span>'}</td>
-                <td>${c.usedByUser ? `<a class="muted" href="/space/${esc(c.usedByUser.username)}">${esc(c.usedByUser.name)} @${esc(c.usedByUser.username)}</a>` : '<span class="muted">-</span>'}</td>
-                <td class="muted">${new Date(c.createdAt).toLocaleString('zh-CN')}</td>
-                <td style="text-align:right;white-space:nowrap">
+                <td data-label="备注" class="muted">${esc(c.note || '-')}</td>
+                <td data-label="状态">${c.usedBy ? '<span class="role-badge banned">已使用</span>' : '<span class="role-badge ok">未使用</span>'}</td>
+                <td data-label="使用者">${c.usedByUser ? `<a class="muted" href="/space/${esc(c.usedByUser.username)}">${esc(c.usedByUser.name)} @${esc(c.usedByUser.username)}</a>` : '<span class="muted">-</span>'}</td>
+                <td data-label="创建时间" class="muted">${new Date(c.createdAt).toLocaleString('zh-CN')}</td>
+                <td class="act-cell">
                   <button class="btn btn-sm btn-ghost act-copy" data-code="${esc(c.code)}">复制</button>
                   <button class="btn btn-sm btn-danger act-del" data-id="${esc(c.id)}" ${c.usedBy ? 'disabled title="已使用的注册码不能删除"' : ''}>删除</button>
                 </td>
@@ -2505,10 +3125,10 @@
             ${boards.map(b => `
               <tr data-id="${esc(b.id)}">
                 <td><span class="bd-dot" data-color="${esc(b.color)}" style="display:inline-block;width:11px;height:11px;border-radius:3px;background:${esc(b.color)};vertical-align:-1px;margin-right:8px"></span><b>${esc(b.name)}</b></td>
-                <td class="muted">${esc(b.slug)}</td>
-                <td class="muted">${esc(b.description || '-')}</td>
-                <td>${b.topicCount}</td>
-                <td style="text-align:right;white-space:nowrap">
+                <td data-label="Slug" class="muted">${esc(b.slug)}</td>
+                <td data-label="简介" class="muted">${esc(b.description || '-')}</td>
+                <td data-label="主题数">${b.topicCount}</td>
+                <td class="act-cell">
                   <button class="btn btn-sm btn-ghost act-edit" data-id="${esc(b.id)}">编辑</button>
                   <button class="btn btn-sm btn-danger act-del" data-id="${esc(b.id)}">删除</button>
                 </td>
@@ -2531,7 +3151,7 @@
         await adminBoards(main);
       } catch (err) { alert(err.message); }
     });
-    main.querySelectorAll('.act-edit').forEach(b => b.addEventListener('click', () => {
+    main.querySelectorAll('.act-edit').forEach(b => b.addEventListener('click', async () => {
       const row = b.closest('tr');
       const id = b.dataset.id;
       const name = prompt('板块名称', row.children[0].textContent.trim());
@@ -2540,9 +3160,13 @@
       if (slug === null) return;
       const color = prompt('颜色（hex）', row.children[0].querySelector('.bd-dot').dataset.color || '#3d6c45');
       const desc = prompt('简介', row.children[2].textContent.trim() === '-' ? '' : row.children[2].textContent.trim());
+      if (desc === null) return;
+      const bd = (await api('/api/boards')).find(x => x.id === id);
+      const tpl = prompt('发帖模板（发帖时自动预填，留空=无模板）：', (bd && bd.topicTemplate) || '');
+      if (tpl === null) return;
       (async () => {
         try {
-          await api('/api/admin/boards/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, slug, color, description: desc }) });
+          await api('/api/admin/boards/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, slug, color, description: desc, topicTemplate: tpl }) });
           state.boards = [];
           await loadBoards();
           await adminBoards(main);
@@ -2595,20 +3219,22 @@
             ${topics.map(t => `
               <tr data-id="${esc(t.id)}">
                 <td style="max-width:300px"><a href="/post/${esc(t.slug)}" target="_blank" class="admin-topic-link">${esc(t.title)}</a></td>
-                <td><a class="muted" href="/space/${esc(t.author.username)}">${esc(t.author.name)}</a></td>
-                <td><span class="tag-chip" style="background:${esc(t.board.color)}33;color:${esc(t.board.color)}">${esc(t.board.name)}</span></td>
-                <td class="muted">${t.replyCount}</td>
-                <td class="muted">${fmtNum(t.viewCount)}</td>
-                <td style="white-space:nowrap">
+                <td data-label="作者"><a class="muted" href="/space/${esc(t.author.username)}">${esc(t.author.name)}</a></td>
+                <td data-label="板块"><span class="tag-chip" style="background:${esc(t.board.color)}33;color:${esc(t.board.color)}">${esc(t.board.name)}</span></td>
+                <td data-label="回复" class="muted">${t.replyCount}</td>
+                <td data-label="浏览" class="muted">${fmtNum(t.viewCount)}</td>
+                <td data-label="状态">
                   ${t.pinned ? '<span class="role-badge pin">置顶</span>' : ''}
                   ${t.recommended ? '<span class="role-badge rec">推荐</span>' : ''}
                   ${t.closed ? '<span class="role-badge banned">已关闭</span>' : ''}
-                  ${!t.pinned && !t.recommended && !t.closed ? '<span class="muted">-</span>' : ''}
+                  ${t.slowMode ? `<span class="role-badge" style="background:#fef3c7;color:#b45309">🐢 ${t.slowMode}s</span>` : ''}
+                  ${!t.pinned && !t.recommended && !t.closed && !t.slowMode ? '<span class="muted">-</span>' : ''}
                 </td>
-                <td style="text-align:right;white-space:nowrap">
+                <td class="act-cell">
                   <button class="btn btn-sm btn-ghost act-pin" data-id="${esc(t.id)}">${t.pinned ? '取消置顶' : '置顶'}</button>
                   <button class="btn btn-sm btn-ghost act-rec" data-id="${esc(t.id)}">${t.recommended ? '取消推荐' : '推荐'}</button>
                   <button class="btn btn-sm btn-ghost act-close" data-id="${esc(t.id)}">${t.closed ? '打开' : '关闭'}</button>
+                  <button class="btn btn-sm btn-ghost act-slow" data-id="${esc(t.id)}" data-slow="${t.slowMode || 0}">🐢 慢速</button>
                   <button class="btn btn-sm btn-danger act-del" data-id="${esc(t.id)}">删除</button>
                 </td>
               </tr>`).join('') || `<tr><td colspan="7" class="muted" style="text-align:center;padding:30px">没有找到话题</td></tr>`}
@@ -2633,6 +3259,17 @@
     bind('.act-pin', '/api/admin/topics/:id/pin');
     bind('.act-rec', '/api/admin/topics/:id/recommend');
     bind('.act-close', '/api/admin/topics/:id/close');
+    main.querySelectorAll('.act-slow').forEach(b => b.addEventListener('click', async () => {
+      const cur = parseInt(b.dataset.slow) || 0;
+      const v = prompt(`设置慢速模式（每人回帖间隔秒数，0=关闭）：\n常用：30秒 / 60秒 / 300秒`, cur || '60');
+      if (v === null) return;
+      const sec = Math.max(0, Math.min(3600, parseInt(v) || 0));
+      try {
+        await api('/api/admin/topics/' + b.dataset.id + '/slowmode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seconds: sec }) });
+        toast(sec ? `已开启慢速模式（${sec}秒）` : '已关闭慢速模式');
+        await adminTopics(main);
+      } catch (e) { alert(e.message); }
+    }));
     main.querySelectorAll('.act-del').forEach(b => b.addEventListener('click', async () => {
       if (!confirm('⚠️ 确认删除该话题？此操作不可恢复！')) return;
       try { await api('/api/admin/topics/' + b.dataset.id, { method: 'DELETE' }); await adminTopics(main); } catch (e) { alert(e.message); }
@@ -2642,12 +3279,134 @@
   /* ---------- core ---------- */
   function renderPage(html) {
     els.pageLoading.classList.add('hidden');
+    hidePtr();
     els.pageRoot.innerHTML = html;
+    /* 页面转场：快速淡入上滑 */
+    els.pageRoot.classList.remove('page-enter');
+    void els.pageRoot.offsetWidth;
+    els.pageRoot.classList.add('page-enter');
     window.scrollTo(0, 0);
+  }
+  /* 骨架屏：路由切换瞬间先占位，体感更快 */
+  function skelRows(n) {
+    let h = '';
+    for (let i = 0; i < n; i++) h += `<div class="skel-row"><div class="skel-block" style="height:18px;width:${62 + (i * 13) % 28}%"></div><div class="skel-block" style="height:12px;width:42%;margin-top:9px"></div></div>`;
+    return `<div class="skel-list">${h}</div>`;
+  }
+  function showSkeleton(path) {
+    els.pageLoading.classList.add('hidden');
+    let html = '';
+    if (path === '/' || path === '') html = skelRows(8);
+    else if (path === '/trends' || path === '/rank' || path === '/boards' || path === '/favorites' || path === '/featured' || path === '/newbies' || path === '/lucky' || path === '/ruling') html = skelRows(8);
+    else if (path.startsWith('/post/')) html = `<div class="skel-card"><div class="skel-block" style="height:24px;width:80%"></div><div class="skel-block" style="height:14px;width:50%"></div><div class="skel-block" style="height:120px;width:100%"></div><div class="skel-block" style="height:60px;width:100%"></div><div class="skel-block" style="height:60px;width:100%"></div></div>`;
+    else if (path.startsWith('/space/') || path === '/companies') html = skelRows(6);
+    if (html) { els.pageRoot.innerHTML = html; return; }
+    els.pageRoot.innerHTML = '';
+    els.pageLoading.classList.remove('hidden');
+  }
+
+  /* 移动端帖子详情页底部评论条：抖音式 写评论 + 💬👍☆🔗，点写评论弹出底部评论面板 */
+  function setupMobileCommentBar(topic) {
+    if (window.innerWidth > 760) return;
+    if (!state.user) return;
+    const replyCount = Math.max(0, (topic.posts || []).length - 1);
+    const bar = document.createElement('div');
+    bar.className = 'mobile-comment-bar';
+    bar.innerHTML = `
+      <button class="mc-write" id="mcWrite">✏️ 写评论...</button>
+      <button class="mc-btn" id="mcComments" title="评论">💬<span class="mc-num">${replyCount}</span></button>
+      <button class="mc-btn" id="mcLike" title="点赞">👍</button>
+      <button class="mc-btn" id="mcFav" title="收藏">${topic.favorited ? '★' : '☆'}</button>
+      <button class="mc-btn" id="mcShare" title="分享">🔗</button>`;
+    document.body.appendChild(bar);
+    document.body.classList.add('has-comment-bar');
+
+    function closeSheet() {
+      document.querySelectorAll('.mc-backdrop,.mc-sheet').forEach(e => e.remove());
+    }
+    /* 抖音式底部评论面板：上滑出现，发送后自动滚到新评论 */
+    function openSheet() {
+      closeSheet();
+      const bd = document.createElement('div');
+      bd.className = 'mc-backdrop';
+      const sheet = document.createElement('div');
+      sheet.className = 'mc-sheet';
+      sheet.innerHTML = `
+        <div class="mc-sheet-handle"></div>
+        <div class="mc-sheet-head"><span>发表评论</span><button class="mc-x" aria-label="关闭">✕</button></div>
+        <textarea id="mcText" placeholder="友善交流，理性发言..." maxlength="2000"></textarea>
+        <div class="mc-sheet-foot">
+          <span class="mc-count"><i id="mcCountNum">0</i> / 2000</span>
+          <button class="mc-send" id="mcSend" disabled>发送</button>
+        </div>`;
+      document.body.append(bd, sheet);
+      requestAnimationFrame(() => { bd.classList.add('show'); sheet.classList.add('show'); });
+      const ta = sheet.querySelector('#mcText');
+      const send = sheet.querySelector('#mcSend');
+      const num = sheet.querySelector('#mcCountNum');
+      ta.addEventListener('input', () => {
+        num.textContent = ta.value.length;
+        send.disabled = !ta.value.trim();
+      });
+      bd.addEventListener('click', closeSheet);
+      sheet.querySelector('.mc-x').addEventListener('click', closeSheet);
+      send.addEventListener('click', async () => {
+        const content = ta.value.trim();
+        if (!content || send.disabled) return;
+        send.disabled = true;
+        send.textContent = '发送中...';
+        const oldCount = document.querySelectorAll('.post-stream .post-item').length;
+        try {
+          await api(`/api/topics/${topic.id}/replies`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }) });
+          closeSheet();
+          toast('评论成功');
+          route(`/post/${topic.slug}`);
+          /* 发完滚到自己的新评论 */
+          let tries = 0;
+          const timer = setInterval(() => {
+            const items = document.querySelectorAll('.post-stream .post-item');
+            if (items.length > oldCount || ++tries > 15) {
+              clearInterval(timer);
+              const last = items[items.length - 1];
+              if (last && items.length > oldCount) last.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+          }, 200);
+        } catch (e) {
+          send.disabled = false;
+          send.textContent = '发送';
+          toast(e.message, 'err');
+        }
+      });
+      ta.focus();
+    }
+
+    document.getElementById('mcWrite').addEventListener('click', openSheet);
+    document.getElementById('mcComments').addEventListener('click', () => {
+      const box = document.querySelector('.reply-box') || document.querySelector('.post-stream');
+      if (box) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    document.getElementById('mcLike').addEventListener('click', async () => {
+      try { await api(`/api/topics/${topic.id}/like`, { method: 'POST' }); route(`/post/${topic.slug}`); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+    document.getElementById('mcFav').addEventListener('click', async () => {
+      try { await api(`/api/topics/${topic.id}/favorite`, { method: 'POST' }); toast('已收藏'); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+    document.getElementById('mcShare').addEventListener('click', () => {
+      const url = location.href;
+      if (navigator.share) navigator.share({ title: topic.title, url }).catch(() => {});
+      else if (navigator.clipboard) { navigator.clipboard.writeText(url).then(() => toast('链接已复制')); }
+    });
   }
 
   function setNav(name) {
     els.navPills.querySelectorAll('a').forEach(a => a.classList.toggle('active', a.dataset.nav === name));
+    /* 移动端 Tab 栏同步高亮（帖子详情页不高亮任何 tab） */
+    const tabMap = { home: 'home', boards: 'boards', compose: 'compose', companies: 'companies', space: 'space' };
+    document.querySelectorAll('#mobileTabbar a[data-tab]').forEach(a => {
+      a.classList.toggle('active', tabMap[name] === a.dataset.tab);
+    });
   }
 
   function closeDrawer() { els.mobileDrawer.classList.remove('open'); els.overlay.classList.add('hidden'); }
@@ -2655,6 +3414,7 @@
 
   async function initAuth() {
     try { const r = await api('/api/auth/me'); state.user = r.user; } catch (e) { state.user = null; }
+    window.__forumUser = state.user || null;
     updateAuthUI();
     renderCheckinPanel();
     if (state.user) refreshUnread();
@@ -2670,6 +3430,8 @@
       const dm = msgs.reduce((a, m) => a + (m.unread || 0), 0);
       els.dmBadge.classList.toggle('hidden', !dm);
       els.dmBadge.textContent = dm;
+      const td = document.getElementById('tabDot');
+      if (td) td.classList.toggle('hidden', !(r.count || dm));
     } catch (e) {}
   }
 
@@ -2677,7 +3439,7 @@
     if (!state.user) return;
     try {
       const list = await api('/api/notifications');
-      const ic = { reply: '💬', mention: '@', message: '✉️', tip: '🍗', bounty: '💰', transfer: '🔁', levelup: '⬆️', achievement: '🏅' };
+      const ic = { reply: '💬', mention: '@', message: '✉️', tip: '🍗', bounty: '💰', transfer: '🔁', levelup: '⬆️', achievement: '🏅', invite_reward: '🎁', reminder: '⏰' };
       els.bellDropdown.innerHTML = `
         <div class="bell-head">通知 <a class="bell-clear" href="#" id="bellClearAll">全部已读</a></div>
         <div class="bell-list">
@@ -2692,6 +3454,8 @@
             else if (n.type === 'transfer') body = `向你转账了 ${esc(n.amount)} 🍗`;
             else if (n.type === 'levelup') body = `恭喜升级到 Lv.${esc(n.level)}「${esc(n.title || '')}」`;
             else if (n.type === 'achievement') body = `解锁成就 ${esc(n.icon || '')}「${esc(n.achName || '')}」`;
+            else if (n.type === 'invite_reward') body = `通过你的邀请码注册了论坛，你获得 ${esc(n.coins || 20)} 🍗 奖励（${esc(n.fromName || '')}）`;
+            else if (n.type === 'reminder') body = `<a class="bell-link" href="${esc(n.link || '/')}">你设置的书签提醒到了：「${esc(n.title || '')}」</a>`;
             else body = `<a class="bell-link" href="/messages/${esc(n.fromUsername || '')}">给你发了一条私信</a>`;
             return `<div class="bell-item ${n.read ? 'read' : ''}" data-id="${esc(n.id)}"><span class="bell-ic">${ic[n.type] || '🔔'}</span><div class="bell-body"><div class="bell-text">${from}${esc(n.fromName || '系统')} ${body}</div><div class="bell-time">${fmtTime(n.createdAt)}</div></div></div>`;
           }).join('') || '<div class="bell-empty">暂无通知</div>'}
@@ -2718,12 +3482,17 @@
       els.profileLink.href = '/space/' + state.user.username;
       els.checkinBtn.classList.remove('hidden');
       els.adminLink.classList.toggle('hidden', !isStaff(state.user));
+      const inv = document.getElementById('inviteLink');
+      if (inv) inv.href = '/space/' + state.user.username + '#invites';
     } else {
       els.authButtons.classList.remove('hidden');
       els.userMenu.classList.add('hidden');
       els.checkinBtn.classList.add('hidden');
       els.adminLink.classList.add('hidden');
+      const inv = document.getElementById('inviteLink');
+      if (inv) inv.href = '/login?next=' + encodeURIComponent('/');
     }
+    renderSideUserCard();
   }
 
   function route(path) {
@@ -2732,9 +3501,24 @@
     handleRoute();
   }
 
+  /* 渲染后滚动到锚点（如 #invites） */
+  function scrollToHash() {
+    const h = location.hash;
+    if (!h) return;
+    requestAnimationFrame(() => {
+      const el = document.querySelector(h);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+
   async function handleRoute() {
+    /* 清理移动端评论条 */
+    document.querySelectorAll('.mobile-comment-bar,.mobile-comment-expand,.mc-backdrop,.mc-sheet').forEach(e => e.remove());
+    document.body.classList.remove('has-comment-bar');
     const url = new URL(location.href);
     const path = url.pathname;
+    /* 管理后台走全宽：隐藏论坛右侧栏，给后台表格腾出空间 */
+    document.body.classList.toggle('wide-mode', path.startsWith('/admin'));
     const params = url.searchParams;
     /* 页面标题随路由更新（标签页/收藏可识别） */
     const SITE = document.title.split(' - ')[0] || '论坛';
@@ -2742,6 +3526,12 @@
     if (path === '/' || path === '') setTitle(params.get('board') ? (state.boards.find(b => b.slug === params.get('board'))?.name || '板块') : '首页');
     else if (path === '/boards') setTitle('全部板块');
     else if (path === '/rank') setTitle('排行榜');
+    else if (path === '/guide') setTitle('新手教程');
+    else if (path === '/trends') setTitle('热点');
+    else if (path === '/featured') setTitle('推荐阅读');
+    else if (path === '/newbies') setTitle('新人墙');
+    else if (path === '/lucky') setTitle('幸运抽奖');
+    else if (path === '/ruling') setTitle('管理记录公示');
     else if (path === '/compose') setTitle('发帖');
     else if (path === '/login') setTitle('登录');
     else if (path === '/register') setTitle('注册');
@@ -2762,17 +3552,28 @@
     else if (path.startsWith('/space/')) setTitle(decodeURIComponent(path.slice(7)) + ' 的空间');
     else setTitle('');
     closeDrawer();
-    els.pageRoot.innerHTML = '';
-    els.pageLoading.classList.remove('hidden');
+    /* 移动端顶部频道栏（虎扑式）：推荐 / 关注 / 热榜 / 板块 */
+    const _feed = params.get('feed') || '';
+    const _ch = path === '/trends' ? 'hot' : path === '/boards' ? 'boards'
+      : (path === '/' || path === '') ? (_feed === 'following' ? 'follow' : (params.get('board') || params.get('tag') ? '' : 'rec')) : '';
+    document.body.classList.toggle('has-channels', !!_ch);
+    document.querySelectorAll('#channelBar a').forEach(a => a.classList.toggle('active', a.dataset.ch === _ch));
+    showSkeleton(path);
 
     try {
       if (path === '/' || path === '') {
         const hb = state.user?.preferences?.homeBoard;
-        await renderHome(params.get('board') || hb || '', params.get('sort') || 'latest', parseInt(params.get('page') || '1', 10));
+        await renderHome(params.get('board') || hb || '', params.get('sort') || 'latest', parseInt(params.get('page') || '1', 10), params.get('feed') || '');
         return;
       }
-      if (path === '/boards') { await renderBoards(); return; }
+      if (path === '/boards') { await renderBoards(params.get('board') || '', parseInt(params.get('page') || '1', 10)); return; }
       if (path === '/rank') { await renderRank(params.get('tab') || 'checkin'); return; }
+      if (path === '/guide') { renderGuide(); return; }
+      if (path === '/trends') { await renderTrends(params.get('tab') || 'day'); return; }
+      if (path === '/featured') { await renderFeatured(); return; }
+      if (path === '/newbies') { await renderNewbies(); return; }
+      if (path === '/lucky') { await renderLucky(); return; }
+      if (path === '/ruling') { await renderRuling(params); return; }
       if (path === '/compose') { await renderCompose(); return; }
       if (path === '/login') { renderLogin(); return; }
       if (path === '/register') { renderRegister(); return; }
@@ -2780,7 +3581,7 @@
       if (path === '/search') { await renderSearch(params.get('q') || ''); return; }
       if (path === '/messages' || path === '/messages/') { await renderMessages(); return; }
       if (path.startsWith('/messages/')) { await renderConversation(decodeURIComponent(path.slice(10))); return; }
-      if (path.startsWith('/tag/')) { await renderTag(decodeURIComponent(path.slice(5))); return; }
+      if (path.startsWith('/tag/')) { await renderTag(decodeURIComponent(path.slice(5)), parseInt(params.get('page') || '1', 10)); return; }
       if (path === '/companies') { await renderCompanies(params); return; }
       if (path === '/companies/watch') { await renderCompanyWatch(); return; }
       if (path.startsWith('/companies/')) { await renderCompanyDetail(decodeURIComponent(path.slice(11))); return; }
@@ -2792,7 +3593,7 @@
       if (path === '/settings' || path === '/settings/') { renderSettings('profile'); return; }
       if (path.startsWith('/settings/')) { renderSettings(path.slice(10) || 'profile'); return; }
       if (path.startsWith('/post/')) { await renderPost(decodeURIComponent(path.slice(6))); return; }
-      if (path.startsWith('/space/')) { await renderSpace(decodeURIComponent(path.slice(7))); return; }
+      if (path.startsWith('/space/')) { await renderSpace(decodeURIComponent(path.slice(7))); scrollToHash(); return; }
       renderPage('<div class="empty-state"><div class="big">🧭</div><p>404 - 页面不存在</p></div>');
     } catch (err) {
       els.pageLoading.classList.add('hidden');
@@ -2805,6 +3606,33 @@
     const a = e.target.closest('a[href^="/"]');
     if (a && !e.ctrlKey && !e.metaKey && !a.target) { e.preventDefault(); route(a.getAttribute('href')); }
   });
+  /* 手指刚碰到帖子链接就预加载详情，点开时直接命中缓存 */
+  document.addEventListener('touchstart', e => {
+    const a = e.target && e.target.closest && e.target.closest('a[href^="/post/"]');
+    if (!a) return;
+    const slug = (a.getAttribute('href').split('/post/')[1] || '').split('?')[0];
+    if (slug) prefetch('/api/topics/' + encodeURIComponent(slug));
+  }, { passive: true });
+  /* 下拉刷新（移动端列表页） */
+  const ptrInd = document.getElementById('ptrInd');
+  let ptrY = null, ptrOn = false;
+  function hidePtr() { ptrOn = false; ptrY = null; if (ptrInd) { ptrInd.classList.remove('on', 'spin'); } }
+  document.addEventListener('touchstart', e => {
+    if (window.innerWidth > 760) return;
+    if (!['/', '/trends', '/boards'].includes(location.pathname)) return;
+    if (window.scrollY > 4) return;
+    ptrY = e.touches[0].clientY;
+  }, { passive: true });
+  document.addEventListener('touchmove', e => {
+    if (ptrY == null || ptrOn) return;
+    if (e.touches[0].clientY - ptrY > 90) { ptrOn = true; if (ptrInd) ptrInd.classList.add('on'); }
+  }, { passive: true });
+  document.addEventListener('touchend', () => {
+    if (!ptrOn) { ptrY = null; return; }
+    if (ptrInd) ptrInd.classList.add('spin');
+    apiCache.clear();
+    handleRoute();
+  }, { passive: true });
   /* 头像加载失败 → 兜底默认 logo（捕获模式，覆盖所有动态渲染的 img） */
   document.addEventListener('error', e => {
     const img = e.target;
@@ -2821,6 +3649,15 @@
     e.preventDefault();
     const q = els.navSearchInput.value.trim();
     if (q) route('/search?q=' + encodeURIComponent(q));
+  });
+  /* 搜索快捷键：/ 或 ctrl+/ 全局聚焦搜索框（输入框内不触发） */
+  document.addEventListener('keydown', e => {
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (document.activeElement && document.activeElement.isContentEditable)) return;
+    if (e.key === '/' || ((e.ctrlKey || e.metaKey) && e.key === '/')) {
+      e.preventDefault();
+      els.navSearchInput.focus();
+    }
   });
   els.checkinBtn.addEventListener('click', doCheckin);
   /* 通知铃铛 */
@@ -2855,6 +3692,7 @@
     e.preventDefault();
     await api('/api/auth/logout', { method: 'POST' });
     state.user = null;
+    window.__forumUser = null;
     updateAuthUI();
     route('/');
   });
@@ -2872,6 +3710,8 @@
   initAuth().then(() => {
     loadBoards();
     loadTags();
+    loadCheckinRank();
+    loadHot24();
     handleRoute();
   });
 })();
