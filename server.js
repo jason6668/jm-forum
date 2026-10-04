@@ -3669,9 +3669,76 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     if (reachedOldest || (t.tgCommentIds || []).length >= 200) t.tgCommentsDone = true;
     if (fresh.length || pages) commentTopics++;
   }
+  /* 社区小助手：给零回复的新帖搭第一句话（官方助手号，帖主会收到回复通知） */
+  let assisted = 0;
+  try {
+    let helper = db.users.find(u => u.username === 'jmhelper');
+    if (!helper) {
+      helper = {
+        id: id('u'), username: 'jmhelper', name: '社区小助手', passwordHash: '',
+        avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
+        checkinCoins: 0, lastCheckin: '', favorites: [],
+        bio: '🤖 社区小助手：负责给新帖子捧场，有事找站长',
+        signature: '新帖别冷场，我先来搭句话', readme: '', contacts: {}, preferences: {},
+        blocked: false, exp: 0, badges: [], title: '官方助手', achievements: {},
+        checkinCount: 0, following: [],
+      };
+      db.users.push(helper);
+    }
+    const BOT_NAMES = new Set(['tgbot', 'newsbot', 'blogbot', 'jmhelper']);
+    db.settings = db.settings || {};
+    const dayKey = todayStr();
+    if (!db.settings.assistDay || db.settings.assistDay.date !== dayKey) db.settings.assistDay = { date: dayKey, count: 0 };
+    const cutoff = Date.now() - 72 * 3600 * 1000;
+    const candidates = (db.topics || [])
+      .filter(t => (t.status || 'published') === 'published' && !t.closed)
+      .filter(t => Array.isArray(t.posts) && t.posts.length === 1)
+      .filter(t => new Date(t.createdAt).getTime() > cutoff)
+      .filter(t => {
+        const op = db.users.find(u => u.id === t.posts[0].userId);
+        return op && !BOT_NAMES.has(op.username);
+      })
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const kw = (x) => String(x || '').replace(/[\s#＃【】\[\]《》「」]+/g, ' ').trim().slice(0, 24);
+    const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+    for (const t of candidates) {
+      if (assisted >= 2 || db.settings.assistDay.count >= 8) break;
+      const title = String(t.title || '').trim();
+      const body = String((t.posts[0] && t.posts[0].content) || '').replace(/\s+/g, ' ').trim();
+      const topicKw = kw(title) || kw(body);
+      const asks = /(怎么|如何|为什么|请教|求助|求推荐|有没有|哪位|咋|吗[？?]?$|[？?])/.test(title + body.slice(0, 60));
+      const shares = /(分享|教程|经验|记录|总结|攻略|测评|体验)/.test(title);
+      let content;
+      if (asks) content = pick([
+        '「' + topicKw + '」这个问题问得好，蹲一个大佬解答，我也想知道 👇',
+        '看到标题就点进来了，「' + topicKw + '」正好我也想搞清楚，等楼下高手现身',
+        '先占个楼，「' + topicKw + '」有答案了记得踢我一下',
+      ]);
+      else if (shares) content = pick([
+        '感谢分享！「' + topicKw + '」先码住慢慢看 📌',
+        '这种实打实的分享最有用了，「' + topicKw + '」收藏了',
+        '楼主辛苦，「' + topicKw + '」写得很实在，先存为敬',
+      ]);
+      else content = pick([
+        '沙发！「' + topicKw + '」这个话题有意思，坐等楼主更新',
+        '前排支持一下，「' + topicKw + '」展开说说呗',
+        '「' + topicKw + '」点进来了，楼主继续，别停 😄',
+      ]);
+      const time = nowIso();
+      t.posts.push({ id: id('p'), topicId: t.id, userId: helper.id, content, createdAt: time, likeCount: 0, postNumber: t.posts.length + 1 });
+      t.replyCount = (t.replyCount || 0) + 1;
+      t.bumpedAt = time;
+      const opUser = db.users.find(u => u.id === t.posts[0].userId);
+      if (opUser && (opUser.preferences && opUser.preferences.notifyReply) !== false) {
+        addNotification(db, opUser.id, 'reply', { topicId: t.id, topicTitle: t.title, fromId: helper.id, fromName: helper.name, content: content.slice(0, 80) });
+      }
+      assisted++;
+      db.settings.assistDay.count++;
+    }
+  } catch (e) { console.error('社区小助手失败:', e.message); }
   saveDb(db);
   await flushNow(); /* 立即落盘，防 serverless 冻结丢数据 */
-  res.json({ ok: true, firstRun, synced: synced.length, backfilled, legacyBackfilled, legacyDone: state.legacy ? !!state.legacy.done : true, legacyOldestId: state.legacy ? state.legacy.oldestId : 0, skippedAds, commentsAdded, commentTopics, backfillDone: !!state.done, oldestId: state.oldestId, lastId: state.lastId, migrated, migrations: migReport, saveError: lastKvError || null, sizes: { bytes: (() => { try { return JSON.stringify(db).length; } catch (e) { return -1; } })(), topics: db.topics.length, posts: db.topics.reduce((a, t) => a + ((t.posts || []).length), 0), companies: (db.companies || []).length, users: (db.users || []).length } });
+  res.json({ ok: true, assisted, firstRun, synced: synced.length, backfilled, legacyBackfilled, legacyDone: state.legacy ? !!state.legacy.done : true, legacyOldestId: state.legacy ? state.legacy.oldestId : 0, skippedAds, commentsAdded, commentTopics, backfillDone: !!state.done, oldestId: state.oldestId, lastId: state.lastId, migrated, migrations: migReport, saveError: lastKvError || null, sizes: { bytes: (() => { try { return JSON.stringify(db).length; } catch (e) { return -1; } })(), topics: db.topics.length, posts: db.topics.reduce((a, t) => a + ((t.posts || []).length), 0), companies: (db.companies || []).length, users: (db.users || []).length } });
 });
 
 
