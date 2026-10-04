@@ -1448,6 +1448,12 @@
           <div class="form-foot">已有账号？<a href="/login?next=${encodeURIComponent(next)}">去登录</a></div>
         </form>
       </div>`);
+    fetch('/api/auth/reg-status').then(r => r.json()).then(st => {
+      if (st && st.open) {
+        const c = document.getElementById('rCode');
+        if (c) { c.required = false; c.placeholder = '🎉 开放注册中，邀请码可不填'; }
+      }
+    }).catch(() => {});
     document.getElementById('registerForm').addEventListener('submit', async e => {
       e.preventDefault();
       try {

@@ -547,31 +547,38 @@ app.post('/api/auth/register', rlAuth, async (req, res) => {
     if (!username || !email || !password) return res.status(400).json({ error: '缺少必填字段' });
     const db = loadDb();
     if (db.users.find(u => u.username === username || u.email === email)) return res.status(409).json({ error: '用户名或邮箱已存在' });
-    // 邀请注册制：必须持有管理员发放的注册码
+    // 邀请注册制：必须持有管理员发放的注册码；开放注册窗口期内免码（总控「注册码中心」开启）
+    const regOpen = !!((db.settings || {}).regOpenUntil && Date.now() < new Date(db.settings.regOpenUntil).getTime());
     const regCode = String(code || '').trim().toUpperCase();
-    if (!regCode) return res.status(400).json({ error: '注册需要注册码，请联系管理员获取' });
-    const rc = (db.regCodes || []).find(c => c.code.toUpperCase() === regCode);
-    if (!rc) return res.status(400).json({ error: '邀请码无效，请检查后重试' });
-    /* 兼容老单次码 + 新多次邀请码 */
-    const maxUses = Math.max(1, rc.maxUses || 1);
-    const usedCount = rc.usedCount || (rc.usedBy ? 1 : 0);
-    if (usedCount >= maxUses) return res.status(400).json({ error: '该邀请码已用完，换一个试试' });
-    if (rc.expiresAt && new Date(rc.expiresAt) < new Date()) return res.status(400).json({ error: '该邀请码已过期' });
+    let rc = null;
+    if (regCode) {
+      rc = (db.regCodes || []).find(c => c.code.toUpperCase() === regCode);
+      if (!rc) return res.status(400).json({ error: '邀请码无效，请检查后重试' });
+      /* 兼容老单次码 + 新多次邀请码 */
+      const maxUses = Math.max(1, rc.maxUses || 1);
+      const usedCount = rc.usedCount || (rc.usedBy ? 1 : 0);
+      if (usedCount >= maxUses) return res.status(400).json({ error: '该邀请码已用完，换一个试试' });
+      if (rc.expiresAt && new Date(rc.expiresAt) < new Date()) return res.status(400).json({ error: '该邀请码已过期' });
+    } else if (!regOpen) {
+      return res.status(400).json({ error: '注册需要注册码，请联系管理员获取' });
+    }
     const profile = defaultProfile();
     const user = { id: id('u'), username, email, name: name || username, passwordHash: hashPw(password), avatar: null, createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 10, checkinCoins: 0, lastCheckin: '', favorites: [], banned: false, ...profile };
     db.users.push(user);
-    rc.usedBy = rc.usedBy || user.id;
-    rc.usedAt = nowIso();
-    rc.usedCount = (rc.usedCount || 0) + 1;
-    rc.usedByList = rc.usedByList || [];
-    rc.usedByList.push(user.id);
-    user.invitedBy = rc.createdBy || null;
-    /* 邀请人奖励 +20 鸡腿 */
-    if (rc.createdBy) {
-      const inviter = db.users.find(u => u.id === rc.createdBy);
-      if (inviter) {
-        inviter.coins = (inviter.coins || 0) + 20;
-        addNotification(db, inviter.id, 'invite_reward', { fromName: user.name || user.username, coins: 20 });
+    if (rc) {
+      rc.usedBy = rc.usedBy || user.id;
+      rc.usedAt = nowIso();
+      rc.usedCount = (rc.usedCount || 0) + 1;
+      rc.usedByList = rc.usedByList || [];
+      rc.usedByList.push(user.id);
+      user.invitedBy = rc.createdBy || null;
+      /* 邀请人奖励 +20 鸡腿 */
+      if (rc.createdBy) {
+        const inviter = db.users.find(u => u.id === rc.createdBy);
+        if (inviter) {
+          inviter.coins = (inviter.coins || 0) + 20;
+          addNotification(db, inviter.id, 'invite_reward', { fromName: user.name || user.username, coins: 20 });
+        }
       }
     }
     const token = newSessionToken();
@@ -584,6 +591,37 @@ app.post('/api/auth/register', rlAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: '注册失败：' + e.message });
   }
+});
+
+/* 开放注册窗口：regOpenUntil 前注册免码 */
+function regWindowState(db) {
+  const until = (db.settings || {}).regOpenUntil || null;
+  return { open: !!(until && Date.now() < new Date(until).getTime()), until };
+}
+async function applyRegWindow(body) {
+  const db = loadDb();
+  db.settings = db.settings || {};
+  if (body && body.off) db.settings.regOpenUntil = null;
+  else {
+    const h = Math.min(Math.max(parseFloat(body && body.hours) || 24, 0.05), 24 * 90);
+    db.settings.regOpenUntil = new Date(Date.now() + h * 3600 * 1000).toISOString();
+  }
+  saveDb(db);
+  await flushNow();
+  return regWindowState(db);
+}
+app.get('/api/auth/reg-status', (req, res) => { res.json(regWindowState(loadDb())); });
+app.get('/api/admin/reg-window', requireAdmin, (req, res) => { res.json(regWindowState(loadDb())); });
+app.post('/api/admin/reg-window', requireAdmin, async (req, res) => {
+  try { res.json(await applyRegWindow(req.body || {})); }
+  catch (e) { res.status(500).json({ error: '设置失败：' + e.message }); }
+});
+app.post('/api/integrations/reg-window', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const ok = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}`);
+  if (!ok) return res.status(401).json({ error: 'unauthorized' });
+  try { res.json(await applyRegWindow(req.body || {})); }
+  catch (e) { res.status(500).json({ error: '设置失败：' + e.message }); }
 });
 
 app.post('/api/auth/login', rlAuth, async (req, res) => {
@@ -3499,7 +3537,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   let migrated = 0;
   const migReport = {};
   for (const [migChannel, mig] of Object.entries(db.tgMigrations)) {
-    if (!mig || mig.done) { if (mig) migReport[migChannel] = { oldestId: mig.oldestId || 0, done: !!mig.done }; continue; }
+    if (!mig) continue;
     const migOpts = { tags: ['树洞', ...(mig.tag ? [mig.tag] : [])], anonymous: !!mig.anonymous, source: 'import' };
     try {
       const rm = await fetch(`https://t.me/s/${migChannel}`, TG_UA);
@@ -3519,6 +3557,8 @@ app.get('/api/cron/tg-sync', async (req, res) => {
         }
       }
     } catch (e) { /* 单轮拉取失败不中断，下轮继续 */ }
+    /* 已搬完的频道到此为止：只持续守最新页搬新帖（用户定：源频道有新投稿自动转移），历史不再重复翻 */
+    if (mig.done) { migReport[migChannel] = { oldestId: mig.oldestId || 0, lastId: mig.lastId || 0, done: true, watching: true }; continue; }
     if (!mig.done && mig.oldestId > 1) {
       for (let page = 0; page < 3 && !mig.done; page++) {
         let older = [];

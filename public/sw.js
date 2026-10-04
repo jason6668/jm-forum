@@ -1,5 +1,5 @@
 /* JM Forum Service Worker - 离线缓存 + 安装为 PWA */
-const CACHE = 'jm-forum-v6';
+const CACHE = 'jm-forum-v7';
 const SHELL = ['/', '/css/style.css', '/js/app.js', '/assets/logo.png', '/manifest.json'];
 
 self.addEventListener('install', (e) => {
