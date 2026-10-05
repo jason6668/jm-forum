@@ -286,21 +286,38 @@
     return `<div class="post-list">${topics.map(postRowHtml).join('')}</div>`;
   }
 
-  function boardTabsHtml(activeSlug) {
-    // 忏悔录、吃瓜区是大家最常去的，钉在最前面，手机上不用横滑半天
+  const SPORT_SLUGS = ['basketball', 'football', 'tennis', 'badminton', 'pingpong', 'volleyball', 'billiards', 'baseball', 'golf', 'esports', 'sports'];
+
+  function boardTabsHtml(activeSlug, hrefFor = (s) => `/?board=${encodeURIComponent(s)}`, allHref = '/', tabCls = '') {
+    // 忏悔录、吃瓜、树洞是大家最常去的，钉在最前面；11 个体育板块合成一个「综合体育」，点开再分
+    const bySlug = (s) => state.boards.find(b => b.slug === s);
+    const chip = (b) => `<a href="${hrefFor(b.slug)}" class="${activeSlug === b.slug ? 'active' : ''}"><span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}</a>`;
     const chips = [
-      `<a href="/" class="${!activeSlug ? 'active' : ''}">全部</a>`,
+      `<a href="${allHref}" class="${!activeSlug ? 'active' : ''}">全部</a>`,
       `<a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>`,
     ];
-    const ordered = [...state.boards.filter(b => b.slug === 'chigua'), ...state.boards.filter(b => b.slug !== 'chigua')];
-    for (const b of ordered) {
-      chips.push(`<a href="/?board=${esc(b.slug)}" class="${activeSlug === b.slug ? 'active' : ''}"><span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}</a>`);
+    for (const s of ['chigua', 'tg-treehole']) { const b = bySlug(s); if (b) chips.push(chip(b)); }
+    const sports = SPORT_SLUGS.map(bySlug).filter(Boolean);
+    const sportsActive = SPORT_SLUGS.includes(activeSlug);
+    if (sports.length) {
+      const sp = bySlug('sports');
+      chips.push(`<a href="#" class="sports-parent${sportsActive ? ' active' : ''}" data-sports-toggle><span class="bd-dot" style="background:${esc(sp ? sp.color : '#06b6d4')}"></span>综合体育 <span class="sp-caret">▾</span></a>`);
     }
-    return `<div class="bt-wrap"><div class="board-tabs">${chips.join('')}</div><div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>`;
+    const pinned = new Set(['chigua', 'tg-treehole', ...SPORT_SLUGS]);
+    for (const b of state.boards) { if (!pinned.has(b.slug)) chips.push(chip(b)); }
+    const sub = sports.length ? `<div class="sports-sub">${sports.map(chip).join('')}</div>` : '';
+    return `<div class="bt-wrap${sportsActive ? ' sports-open' : ''}"><div class="board-tabs${tabCls}">${chips.join('')}</div>${sub}<div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>`;
   }
 
-  // 手机端「全部板块」：默认单行横滑，点开摊成完整网格
+  // 手机端「全部板块」：默认单行横滑，点开摊成完整网格；「综合体育」点开展开细分的体育板块
   document.addEventListener('click', (e) => {
+    const sp = e.target.closest('[data-sports-toggle]');
+    if (sp) {
+      e.preventDefault();
+      const wrap = sp.closest('.bt-wrap');
+      if (wrap) wrap.classList.toggle('sports-open');
+      return;
+    }
     const btn = e.target.closest('[data-bt-more]');
     if (!btn) return;
     const wrap = btn.closest('.bt-wrap');
@@ -535,14 +552,7 @@
     const cur = Math.min(page, pages);
     const buildUrl = (p) => '/boards' + (boardSlug ? `?board=${encodeURIComponent(boardSlug)}` : '') + (p > 1 ? `${boardSlug ? '&' : '?'}page=${p}` : '');
     renderPage(`
-      <div class="bt-wrap"><div class="board-tabs ch-board-tabs">
-        <a href="/boards" class="${!boardSlug ? 'active' : ''}">全部</a>
-        <a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>
-        ${[...state.boards.filter(b => b.slug === 'chigua'), ...state.boards.filter(b => b.slug !== 'chigua')].map(b => `
-          <a href="/boards?board=${esc(b.slug)}" class="${boardSlug === b.slug ? 'active' : ''}">
-            <span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}
-          </a>`).join('')}
-      </div><div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>
+      ${boardTabsHtml(boardSlug, (s) => `/boards?board=${encodeURIComponent(s)}`, '/boards', ' ch-board-tabs')}
       ${pages > 1 ? `<div style="display:flex;justify-content:flex-end;margin:2px 2px 10px">${pager(cur, pages, buildUrl, true)}</div>` : ''}
       ${postListHtml(topics)}
       ${pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : ''}

@@ -273,6 +273,14 @@ img { max-width: 100%; }
 .board-tabs a.active { background: var(--accent); border-color: transparent; color: #fff; box-shadow: 0 3px 12px rgba(61,108,69,0.25); }
 .board-tabs a .bd-dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 6px; vertical-align: 1px; }
 .bt-more-row { display: none; } /* 展开钮只在手机端出现 */
+/* 综合体育：点开才展开细分的体育板块 */
+.sports-sub { display: none; gap: 7px; flex-wrap: wrap; margin: 2px 0 14px; }
+.bt-wrap.sports-open .sports-sub { display: flex; }
+.sports-sub a { padding: 7px 15px; border-radius: 20px; font-size: 13.5px; font-weight: 600; background: #fff; border: 1px solid var(--border); color: var(--text-dim); transition: all .15s; }
+.sports-sub a:hover { color: var(--text); background: var(--bg-hover); }
+.sports-sub a.active { background: var(--accent); border-color: transparent; color: #fff; }
+.sports-parent .sp-caret { display: inline-block; font-size: 10px; margin-left: 2px; transition: transform .15s; }
+.bt-wrap.sports-open .sp-caret { transform: rotate(180deg); }
 
 .sort-tabs { display: flex; gap: 4px; }
 .sort-tabs a { padding: 5px 11px; border-radius: 14px; font-size: 12.5px; color: var(--text-muted); }
@@ -1094,6 +1102,8 @@ html[data-theme="dark"] .toast { box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
   .bt-more { background: none; border: none; color: var(--text-muted); font-size: 12.5px; font-weight: 600; padding: 4px 2px; min-height: 32px; cursor: pointer; }
   .bt-wrap.open .board-tabs { flex-wrap: wrap; overflow-x: visible; }
   .bt-wrap.open .board-tabs a { flex-shrink: 1; }
+  .sports-sub { margin: -2px 0 10px; }
+  .sports-sub a { padding: 6px 13px; font-size: 13px; }
 
   /* 排序 tabs：防换行+横向滚动 */
   .sort-tabs { overflow-x: auto; scrollbar-width: none; margin: 0 -4px; padding: 0 4px; }
