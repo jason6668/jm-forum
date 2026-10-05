@@ -3400,16 +3400,28 @@ app.post('/api/integrations/tg-migrate', async (req, res) => {
   }
   const existing = db.tgMigrations[migChannel];
   if (!existing) {
+    /* 已搬过的频道（如旧同步源）：按论坛里已有帖子的编号初始化进度，已搬满历史的直接进守望模式只补新帖，不重搬 */
+    const board0 = db.boards.find(b => b.slug === 'tg-treehole');
+    const mids = board0 ? db.topics
+      .filter(t => t.boardId === board0.id && ((t.tgChannel || '') === migChannel || (t.tgFromChannel || '') === migChannel))
+      .map(t => (typeof t.tgMid === 'number' ? t.tgMid : (typeof t.tgFromMid === 'number' ? t.tgFromMid : 0)))
+      .filter(x => x > 0) : [];
+    const initLast = mids.length ? Math.max(...mids) : 0;
+    const initOldest = mids.length ? Math.min(...mids) : 0;
     db.tgMigrations[migChannel] = {
       tag: String(body.tag || '').slice(0, 20),
       anonymous: !!body.anonymous,
-      lastId: 0, oldestId: 0, done: false, emptyHits: 0,
+      lastId: initLast, oldestId: initOldest, done: !!mids.length && initOldest <= 1, emptyHits: 0,
       registeredAt: nowIso(),
     };
   } else {
     if (body.tag !== undefined) existing.tag = String(body.tag || '').slice(0, 20);
     if (body.anonymous !== undefined) existing.anonymous = !!body.anonymous;
     if (body.resume) { existing.done = false; existing.emptyHits = 0; }
+    /* 进度覆盖（补搬缺口用）：把 oldestId 拨回缺口上方并置 done=false，同步轮次会向下逐页补齐 */
+    if (Number.isFinite(body.oldestId) && body.oldestId > 1) existing.oldestId = Math.floor(body.oldestId);
+    if (Number.isFinite(body.lastId) && body.lastId >= 0) existing.lastId = Math.floor(body.lastId);
+    if (body.done !== undefined) existing.done = !!body.done;
   }
   saveDb(db);
   await flushNow();
@@ -3819,7 +3831,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     /* 已搬完的频道到此为止：只持续守最新页搬新帖（用户定：源频道有新投稿自动转移），历史不再重复翻 */
     if (mig.done) { migReport[migChannel] = { oldestId: mig.oldestId || 0, lastId: mig.lastId || 0, done: true, watching: true }; continue; }
     if (!mig.done && mig.oldestId > 1) {
-      for (let page = 0; page < 3 && !mig.done; page++) {
+      for (let page = 0; page < 6 && !mig.done; page++) {
         let older = [];
         try {
           const r4 = await fetch(`https://t.me/s/${migChannel}?before=${mig.oldestId}`, TG_UA);
