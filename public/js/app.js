@@ -286,36 +286,53 @@
     return `<div class="post-list">${topics.map(postRowHtml).join('')}</div>`;
   }
 
-  const SPORT_SLUGS = ['basketball', 'football', 'tennis', 'badminton', 'pingpong', 'volleyball', 'billiards', 'baseball', 'golf', 'esports', 'sports'];
+  // 板块分组：同类板块合成一个入口，点开再分（key 用于展开状态，title 为合并后显示名）
+  const TAB_GROUPS = [
+    { key: 'tech', title: '科技数码', color: '#4aa8ff', slugs: ['tech', 'dev', 'review'] },
+    { key: 'deal', title: '交易福利', color: '#34d399', slugs: ['trade', 'fuli'] },
+    { key: 'sports', title: '综合体育', color: '#06b6d4', slugs: ['basketball', 'football', 'tennis', 'badminton', 'pingpong', 'volleyball', 'billiards', 'baseball', 'golf', 'esports', 'sports'] },
+    { key: 'sync', title: '同步动态', color: '#3b82f6', slugs: ['blog', 'moments'] },
+  ];
 
   function boardTabsHtml(activeSlug, hrefFor = (s) => `/?board=${encodeURIComponent(s)}`, allHref = '/', tabCls = '') {
-    // 忏悔录、吃瓜、树洞是大家最常去的，钉在最前面；11 个体育板块合成一个「综合体育」，点开再分
+    // 忏悔录、吃瓜、树洞钉在最前面；其余按原有顺序排，同类板块在首次出现的位置合并成一个可展开入口
     const bySlug = (s) => state.boards.find(b => b.slug === s);
     const chip = (b) => `<a href="${hrefFor(b.slug)}" class="${activeSlug === b.slug ? 'active' : ''}"><span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}</a>`;
+    const groupOf = (slug) => TAB_GROUPS.find(g => g.slugs.includes(slug));
     const chips = [
       `<a href="${allHref}" class="${!activeSlug ? 'active' : ''}">全部</a>`,
       `<a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>`,
     ];
     for (const s of ['chigua', 'tg-treehole']) { const b = bySlug(s); if (b) chips.push(chip(b)); }
-    const sports = SPORT_SLUGS.map(bySlug).filter(Boolean);
-    const sportsActive = SPORT_SLUGS.includes(activeSlug);
-    if (sports.length) {
-      const sp = bySlug('sports');
-      chips.push(`<a href="#" class="sports-parent${sportsActive ? ' active' : ''}" data-sports-toggle><span class="bd-dot" style="background:${esc(sp ? sp.color : '#06b6d4')}"></span>综合体育 <span class="sp-caret">▾</span></a>`);
+    const doneGroups = new Set();
+    const openGroups = new Set();
+    for (const b of state.boards) {
+      if (b.slug === 'chigua' || b.slug === 'tg-treehole') continue;
+      const g = groupOf(b.slug);
+      if (!g) { chips.push(chip(b)); continue; }
+      if (doneGroups.has(g.key)) continue;
+      doneGroups.add(g.key);
+      const members = g.slugs.map(bySlug).filter(Boolean);
+      if (!members.length) continue;
+      const gActive = g.slugs.includes(activeSlug);
+      if (gActive) openGroups.add(g.key);
+      chips.push(`<a href="#" class="group-parent${gActive ? ' active open' : ''}" data-group-toggle="${g.key}"><span class="bd-dot" style="background:${esc(g.color)}"></span>${esc(g.title)} <span class="sp-caret">▾</span></a>`);
     }
-    const pinned = new Set(['chigua', 'tg-treehole', ...SPORT_SLUGS]);
-    for (const b of state.boards) { if (!pinned.has(b.slug)) chips.push(chip(b)); }
-    const sub = sports.length ? `<div class="sports-sub">${sports.map(chip).join('')}</div>` : '';
-    return `<div class="bt-wrap${sportsActive ? ' sports-open' : ''}"><div class="board-tabs${tabCls}">${chips.join('')}</div>${sub}<div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>`;
+    const subs = TAB_GROUPS.map(g => {
+      const members = g.slugs.map(bySlug).filter(Boolean);
+      return members.length ? `<div class="group-sub" data-group-sub="${g.key}">${members.map(chip).join('')}</div>` : '';
+    }).join('');
+    const wrapCls = [...openGroups].map(k => 'go-' + k).join(' ');
+    return `<div class="bt-wrap${wrapCls ? ' ' + wrapCls : ''}"><div class="board-tabs${tabCls}">${chips.join('')}</div>${subs}<div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>`;
   }
 
-  // 手机端「全部板块」：默认单行横滑，点开摊成完整网格；「综合体育」点开展开细分的体育板块
+  // 手机端「全部板块」：默认单行横滑，点开摊成完整网格；分组入口点开展开细分板块
   document.addEventListener('click', (e) => {
-    const sp = e.target.closest('[data-sports-toggle]');
+    const sp = e.target.closest('[data-group-toggle]');
     if (sp) {
       e.preventDefault();
       const wrap = sp.closest('.bt-wrap');
-      if (wrap) wrap.classList.toggle('sports-open');
+      if (wrap) { wrap.classList.toggle('go-' + sp.dataset.groupToggle); sp.classList.toggle('open'); }
       return;
     }
     const btn = e.target.closest('[data-bt-more]');
