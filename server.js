@@ -19,7 +19,9 @@ const COOKIE_SECRET = process.env.COOKIE_SECRET || 'forum-secret-2026';
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser(COOKIE_SECRET));
-app.use('/assets', express.static(path.join(__dirname, 'public', 'assets')));
+app.use('/assets', express.static(path.join(__dirname, 'public', 'assets'), {
+  setHeaders(res) { res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); },
+}));
 
 /* ================= storage ================= */
 /* 存储抽象：本地开发用 JSON 文件持久化；部署到 Vercel 时自动切换到 KV（Upstash REST API），业务代码无需区分 */
@@ -2606,6 +2608,95 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   });
 });
 
+/* 端点容错：台账里有裸域名（缺 https://）时自动补全，避免 fetch 报 Failed to parse URL */
+function kvBaseUrl(base) {
+  let b = String(base || '').trim().replace(/\/+$/, '');
+  if (b && !/^https?:\/\//i.test(b)) b = 'https://' + b;
+  return b;
+}
+async function kvInfo(base, token) {
+  const r = await fetch(kvBaseUrl(base), { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(['INFO']) });
+  if (!r.ok) throw new Error('INFO ' + r.status);
+  const j = await r.json(); const s = String(j.result || '');
+  const num = k => { const m = s.match(new RegExp('^' + k + ':(\\d+)', 'm')); return m ? Number(m[1]) : null; };
+  const km = s.match(/^db0:keys=(\d+)/m);
+  const netIn = num('total_net_input_bytes');
+  const netOut = num('total_net_output_bytes');
+  const bandwidthBytes = (netIn === null && netOut === null) ? null : (netIn || 0) + (netOut || 0);
+  return { usedMemory: num('used_memory'), maxMemory: num('maxmemory'), totalCommands: num('total_commands_processed'), uptimeSec: num('uptime_in_seconds'), keys: km ? Number(km[1]) : null, netInputBytes: netIn, netOutputBytes: netOut, bandwidthBytes, bandwidthLimitBytes: 10 * 1024 * 1024 * 1024 };
+}
+async function kvCmd(base, token, cmd) {
+  const r = await fetch(kvBaseUrl(base), { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(cmd) });
+  if (!r.ok) throw new Error('KV ' + r.status);
+  const j = await r.json(); return j.result;
+}
+/* 独立库注册表（UPMON_DBS 环境变量 JSON）+ 监控历史存 malaoshi-panel 的 dbmon:history */
+function upmonRegistry() { try { return JSON.parse(process.env.UPMON_DBS || '[]'); } catch { return []; } }
+async function collectDbStats(forceSnap) {
+  const out = [];
+  try { out.push({ name: 'musema', label: '论坛主库 musema（核心+话题A）', ok: true, ...(await kvInfo(KV_BASE, KV_TOKEN)) }); }
+  catch (e) { out.push({ name: 'musema', label: '论坛主库 musema（核心+话题A）', ok: false, error: String(e.message || e).slice(0, 80) }); }
+  if (SHARD_MODE) {
+    try { out.push({ name: 'square-ant', label: '论坛分片 square-ant（话题B）', ok: true, ...(await kvInfo(KV2_BASE, KV2_TOKEN)) }); }
+    catch (e) { out.push({ name: 'square-ant', label: '论坛分片 square-ant（话题B）', ok: false, error: String(e.message || e).slice(0, 80) }); }
+  }
+  const registry = upmonRegistry();
+  for (const d of registry) {
+    try { out.push({ name: d.name, label: d.label || d.name, account: d.account || '', region: d.region || '', purpose: d.purpose || '', ok: true, ...(await kvInfo(d.endpoint, d.token)) }); }
+    catch (e) { out.push({ name: d.name, label: d.label || d.name, account: d.account || '', region: d.region || '', purpose: d.purpose || '', ok: false, error: String(e.message || e).slice(0, 80) }); }
+  }
+  let history = [];
+  let creds = [];
+  const histDb = registry.find(d => d.name === 'malaoshi-panel');
+  if (histDb) {
+    try {
+      const lastRaw = await kvCmd(histDb.endpoint, histDb.token, ['LINDEX', 'dbmon:history', 0]);
+      const snap = { ts: Date.now(), dbs: {} };
+      out.forEach(d => { if (d.ok) snap.dbs[d.name] = { m: d.usedMemory, k: d.keys, c: d.totalCommands, b: d.bandwidthBytes }; });
+      if (forceSnap || !lastRaw || (snap.ts - (JSON.parse(lastRaw).ts || 0) > 55 * 60000)) {
+        await kvCmd(histDb.endpoint, histDb.token, ['LPUSH', 'dbmon:history', JSON.stringify(snap)]);
+        await kvCmd(histDb.endpoint, histDb.token, ['LTRIM', 'dbmon:history', 0, 999]);
+      }
+      const raws = await kvCmd(histDb.endpoint, histDb.token, ['LRANGE', 'dbmon:history', 0, 167]);
+      history = (raws || []).map(x => { try { return JSON.parse(x); } catch { return null; } }).filter(Boolean);
+      try {
+        const credRaw = await kvCmd(histDb.endpoint, histDb.token, ['GET', 'dbmon:creds']);
+        const parsed = credRaw ? JSON.parse(credRaw) : [];
+        creds = Array.isArray(parsed) ? parsed : [];
+      } catch { creds = []; }
+    } catch { history = []; }
+  }
+  return { dbs: out, history, creds };
+}
+app.get('/api/admin/db-stats', requireAdmin, async (req, res) => {
+  res.json(await collectDbStats(req.query.snap === '1'));
+});
+/* 凭据备份写入监控历史库（仅内部同步密钥可调，面板登录后只读展示） */
+app.post('/api/integrations/db-creds', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const ok = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}`);
+  if (!ok) return res.status(401).json({ error: 'unauthorized' });
+  const registry = upmonRegistry();
+  const histDb = registry.find(d => d.name === 'malaoshi-panel');
+  if (!histDb) return res.status(500).json({ error: 'history db missing' });
+  const creds = Array.isArray(req.body && req.body.creds) ? req.body.creds.slice(0, 100) : null;
+  if (!creds) return res.status(400).json({ error: 'creds array required' });
+  try {
+    await kvCmd(histDb.endpoint, histDb.token, ['SET', 'dbmon:creds', JSON.stringify(creds)]);
+    res.json({ ok: true, count: creds.length });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e).slice(0, 80) });
+  }
+});
+/* 监控快照定时入口（与 tg-sync 同密钥）：外部 cron 每小时调一次，历史自动生长 */
+app.get('/api/cron/dbmon-snap', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.headers['x-sync-secret'] === secret || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  const r = await collectDbStats(true);
+  res.json({ ok: true, dbs: r.dbs.length, snaps: r.history.length, creds: (r.creds || []).length });
+});
+
 /* 14 日趋势：每日新增用户 / 主题 / 回复 */
 app.get('/api/admin/stats/trend', requireAdmin, (req, res) => {
   const db = loadDb();
@@ -4643,8 +4734,16 @@ app.get('/api/admin/export', requireAdmin, (req, res) => {
 });
 
 /* ================= static ================= */
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+/* 静态大文件（js/css/assets）带版本号 ?v= 发布：给一年的强缓存，浏览器不再每次经函数回源拉 232KB 的 app.js。
+   首页/sw/manifest 保持 no-cache，保证新版发布即时生效。 */
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders(res, filePath) {
+    const p = filePath.replace(/\\/g, '/');
+    if (/\/(js|css|assets)\//.test(p)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    else res.setHeader('Cache-Control', 'no-cache');
+  },
+}));
+app.get('*', (req, res) => { res.setHeader('Cache-Control', 'no-cache'); res.sendFile(path.join(__dirname, 'public', 'index.html')); });
 
 
 /* ================= boot ================= */

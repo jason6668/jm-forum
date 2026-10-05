@@ -1368,3 +1368,16 @@ body { overscroll-behavior-y: none; }
   .admin-table .act-cell .btn { margin: 0; min-height: 40px; padding: 8px 14px; font-size: 13.5px; }
   .pending-actions .btn { min-height: 40px; }
 }
+
+/* 点击即时反馈（2026-10-05）：PC 端补按压反馈（原有缩放只在触屏生效）+ 按钮忙碌转圈，配合 app.js 的 apiBusy */
+@media (hover: hover) and (pointer: fine) {
+  button, .btn, .like-btn, .chip, .mcb-btn { transition: transform .08s ease-out, opacity .08s ease-out; }
+  button:active, .btn:active, .like-btn:active, .chip:active, .mcb-btn:active { transform: scale(.95); opacity: .78; }
+}
+button.is-busy, .btn.is-busy, .like-btn.is-busy { position: relative; pointer-events: none; opacity: .6; }
+button.is-busy::after, .btn.is-busy::after, .like-btn.is-busy::after {
+  content: ''; position: absolute; right: 6px; top: 50%; width: 12px; height: 12px; margin-top: -6px;
+  border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%;
+  animation: jmSpin .55s linear infinite;
+}
+@keyframes jmSpin { to { transform: rotate(360deg); } }

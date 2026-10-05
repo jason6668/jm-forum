@@ -36,6 +36,23 @@
 
   /* ---------- api ---------- */
   const apiCache = new Map();
+  /* 点击即时反馈：记住最近按下的按钮，api() 请求期间给它加忙碌态（转圈 + 防重复点） */
+  let lastTapEl = null, lastTapAt = 0;
+  document.addEventListener('pointerdown', (e) => {
+    const el = e.target && e.target.closest ? e.target.closest('button, .btn, [role="button"]') : null;
+    if (el) { lastTapEl = el; lastTapAt = Date.now(); }
+  }, true);
+  function apiBusyStart() {
+    if (lastTapEl && Date.now() - lastTapAt < 800) {
+      lastTapEl._busyN = (lastTapEl._busyN || 0) + 1;
+      lastTapEl.classList.add('is-busy');
+      return lastTapEl;
+    }
+    return null;
+  }
+  function apiBusyEnd(el) {
+    if (el && el._busyN) { el._busyN--; if (el._busyN <= 0) el.classList.remove('is-busy'); }
+  }
   async function api(path, opts = {}) {
     const isGet = !opts.method || opts.method === 'GET';
     if (!isGet) apiCache.clear(); /* 写操作后缓存失效，保证数据新鲜 */
@@ -43,7 +60,11 @@
       const hit = apiCache.get(path);
       if (hit && Date.now() - hit.t < 20000) return hit.d;
     }
-    const res = await fetch(path, { credentials: 'same-origin', ...opts });
+    const silent = !!opts.silent;
+    const fo = { ...opts }; delete fo.silent;
+    const busyEl = silent ? null : apiBusyStart();
+    try {
+    const res = await fetch(path, { credentials: 'same-origin', ...fo });
     if (!res.ok) {
       let msg = res.statusText, extra = {};
       try { const j = await res.json(); msg = j.error || msg; extra = j; } catch (e) {}
@@ -57,8 +78,9 @@
       if (apiCache.size > 80) apiCache.delete(apiCache.keys().next().value);
     }
     return d;
+    } finally { apiBusyEnd(busyEl); }
   }
-  function prefetch(path) { api(path).catch(() => {}); }
+  function prefetch(path) { api(path, { silent: true }).catch(() => {}); }
 
   /* ---------- utils ---------- */
   function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
