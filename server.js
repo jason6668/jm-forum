@@ -27,7 +27,42 @@ const IS_VERCEL = !!process.env.VERCEL || !!process.env.KV_REST_API_URL || !!pro
 const KV_BASE = process.env.KV_REST_API_URL || process.env.KV_URL || '';
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.KV_TOKEN || '';
 const DB_KEY = 'jm_forum_db_v1';
+/* 双库分片（2026-10-05）：免费库单月流量上限 10GB，整库 7MB 反复整拉几天就烧爆（13GB 停用事故）。
+   设了 KV_REST_API_URL_2 + KV_REST_API_TOKEN_2 时启用分片：核心数据（用户/会话/设置）存主库，
+   帖子按序号拆两半分存两库（jm_forum_topics_a / jm_forum_topics_b），每库只扛约一半流量。
+   未设 2 号库时走单库整存，兼容旧整存数据；首次以分片模式写入即自动完成数据拆分迁移。 */
+const KV2_BASE = process.env.KV_REST_API_URL_2 || '';
+const KV2_TOKEN = process.env.KV_REST_API_TOKEN_2 || '';
+const SHARD_MODE = !!(KV2_BASE && KV2_TOKEN);
+const TOPIC_KEY_A = 'jm_forum_topics_a';
+const TOPIC_KEY_B = 'jm_forum_topics_b';
 let cacheDb = null;
+
+function packGz(obj) {
+  return 'gz1:' + require('zlib').gzipSync(Buffer.from(JSON.stringify(obj), 'utf8')).toString('base64');
+}
+function unpackGz(result) {
+  /* gz1: 前缀 = gzip+base64 压缩存储（整库 JSON 已超 KV 单值上限，必须压缩） */
+  if (typeof result === 'string' && result.startsWith('gz1:')) {
+    return JSON.parse(require('zlib').gunzipSync(Buffer.from(result.slice(4), 'base64')).toString('utf8'));
+  }
+  return typeof result === 'string' ? JSON.parse(result) : result;
+}
+async function kvGetKey(base, token, key) {
+  const res = await fetch(`${base}/get/${key}`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error('KV get ' + res.status);
+  const data = await res.json();
+  if (data.result === null || data.result === undefined) return null;
+  return unpackGz(data.result);
+}
+async function kvSetKey(base, token, key, obj) {
+  const res = await fetch(`${base}/set/${key}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/plain' },
+    body: packGz(obj),
+  });
+  if (!res.ok) { const _t = await res.text().catch(() => ''); throw new Error('KV set ' + key + ' ' + res.status + ' ' + _t.slice(0, 120)); }
+}
 
 function emptyDb() {
   return { users: [], boards: [], tags: [], topics: [], sessions: {}, regCodes: [], settings: {}, companies: [], messages: [], notifications: [], reports: [] };
@@ -38,24 +73,75 @@ function ensureDb() {
   if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify(emptyDb(), null, 2));
 }
 async function kvGet() {
-  const res = await fetch(`${KV_BASE}/get/${DB_KEY}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
-  if (!res.ok) throw new Error('KV get ' + res.status);
-  const data = await res.json();
-  if (data.result === null || data.result === undefined) return null;
-  /* 新格式：gz1: 前缀 = gzip+base64 压缩存储（整库 JSON 已超 KV 单值上限，必须压缩） */
-  if (typeof data.result === 'string' && data.result.startsWith('gz1:')) {
-    return JSON.parse(require('zlib').gunzipSync(Buffer.from(data.result.slice(4), 'base64')).toString('utf8'));
+  const core = await kvGetKey(KV_BASE, KV_TOKEN, DB_KEY);
+  if (!core) return null;
+  if (core.__shard === 2 && SHARD_MODE) {
+    /* 分片合并：A/B 两半按原序号交错还原（A 存偶数位、B 存奇数位） */
+    const [sa, sb] = await Promise.all([
+      kvGetKey(KV_BASE, KV_TOKEN, TOPIC_KEY_A).catch(() => null),
+      kvGetKey(KV2_BASE, KV2_TOKEN, TOPIC_KEY_B).catch(() => null),
+    ]);
+    const topicsA = (sa && sa.topics) || [];
+    const topicsB = (sb && sb.topics) || [];
+    /* 分片完整性：只读到一半或两半全空都视为读失败，宁可只读顶着也不许把残缺快照回写 */
+    if ((sa === null) !== (sb === null)) throw new Error('partial shard read');
+    if (!topicsA.length && !topicsB.length) throw new Error('shard read empty');
+    const merged = [];
+    const n = Math.max(topicsA.length, topicsB.length);
+    for (let i = 0; i < n; i++) {
+      if (topicsA[i]) merged.push(topicsA[i]);
+      if (topicsB[i]) merged.push(topicsB[i]);
+    }
+    core.topics = merged;
+    delete core.__shard;
   }
-  return typeof data.result === 'string' ? JSON.parse(data.result) : data.result;
+  return core;
 }
+/* 省流量节流：实例内存已有数据时，回源整库拉取最多每 minIntervalMs 一次。
+   免费库流量按 GB 计，整库反复整拉是 2026-10-04 停用事故的主因。 */
+let lastKvRefreshAt = 0;
+async function kvGetThrottled(minIntervalMs) {
+  const now = Date.now();
+  if (now - lastKvRefreshAt < (minIntervalMs || 60000)) return null;
+  lastKvRefreshAt = now;
+  return kvGet();
+}
+/* 防覆写护栏（2026-10-04 空库事故）：KV 读失败/为空时绝不把空快照写回 KV；
+   快照规模骤降（话题数 < 历史峰值 30%）时拒绝落盘。宁可写失败，不可覆写真数据。 */
+let kvLoadedOk = false;
+let maxTopicsSeen = 0;
 async function kvSet(db) {
-  const packed = 'gz1:' + require('zlib').gzipSync(Buffer.from(JSON.stringify(db), 'utf8')).toString('base64');
+  if (IS_VERCEL) {
+    const t = (db && db.topics || []).length;
+    if (t > maxTopicsSeen) maxTopicsSeen = t;
+    if (!kvLoadedOk && t < 100) {
+      console.error('KV set blocked: this instance never loaded real data from KV (topics=' + t + ')');
+      return;
+    }
+    if (maxTopicsSeen > 200 && t < maxTopicsSeen * 0.3) {
+      throw new Error('KV set blocked: snapshot shrank ' + maxTopicsSeen + ' -> ' + t + ' topics');
+    }
+  }
+  if (SHARD_MODE && IS_VERCEL) {
+    /* 分片写入：核心数据（topics 抠掉）进主库，帖子拆两半分存两库 */
+    const topics = db.topics || [];
+    const topicsA = [], topicsB = [];
+    topics.forEach((tp, i) => (i % 2 === 0 ? topicsA : topicsB).push(tp));
+    const core = { ...db, topics: [], __shard: 2 };
+    await kvSetKey(KV_BASE, KV_TOKEN, DB_KEY, core);
+    await Promise.all([
+      kvSetKey(KV_BASE, KV_TOKEN, TOPIC_KEY_A, { topics: topicsA }),
+      kvSetKey(KV2_BASE, KV2_TOKEN, TOPIC_KEY_B, { topics: topicsB }),
+    ]);
+    return;
+  }
+  const packed = packGz(db);
   const res = await fetch(`${KV_BASE}/set/${DB_KEY}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' },
     body: packed,
   });
-  if (!res.ok) throw new Error('KV set ' + res.status);
+  if (!res.ok) { const _t = await res.text().catch(() => ''); throw new Error('KV set ' + res.status + ' ' + _t.slice(0, 150)); }
 }
 /* Vercel 下 KV 写入合并：普通写延迟 ~1.2s 批量落盘（省 KV 配额），注册/登录等关键写走 flushNow 立即落盘 */
 let kvTimer = null;
@@ -403,10 +489,20 @@ let bootPromise = null;
 function boot() {
   if (!bootPromise) bootPromise = (async () => {
     if (IS_VERCEL) {
-      cacheDb = await kvGet().catch(() => null) || emptyDb();
+      const loaded = await kvGet().catch(() => null);
+      if (loaded) {
+        kvLoadedOk = true;
+        lastKvRefreshAt = Date.now();
+        maxTopicsSeen = (loaded.topics || []).length;
+        cacheDb = loaded;
+      } else {
+        /* KV 读不到：只在内存里用种子数据顶着看，绝不回写（kvSet 护栏会拦） */
+        console.error('KV load failed at boot: serving seed data in-memory only, writes to KV are blocked');
+        cacheDb = emptyDb();
+      }
       seed(cacheDb);
       migrate(cacheDb);
-      await kvSet(cacheDb);
+      if (kvLoadedOk) await kvSet(cacheDb);
     } else {
       ensureDb();
       const db = loadDb();
@@ -436,7 +532,7 @@ function authMiddleware(req, res, next) {
   if (db && db.sessions && db.sessions[token]) return resolve();
   // 缓存未命中：可能该会话写在了其他 serverless 实例，回源 KV 重载一次
   if (IS_VERCEL) {
-    kvGet().then(kvdb => { if (kvdb) cacheDb = kvdb; resolve(); }).catch(() => resolve());
+    kvGetThrottled(20000).then(kvdb => { if (kvdb) cacheDb = kvdb; resolve(); }).catch(() => resolve());
   } else resolve();
 }
 app.use(authMiddleware);
@@ -3191,7 +3287,7 @@ app.post('/api/integrations/tg-migrate', async (req, res) => {
   const body = req.body || {};
   const migChannel = String(body.channel || '').replace(/^@/, '').replace(/[^A-Za-z0-9_]/g, '');
   if (!migChannel) return res.status(400).json({ error: '频道名不能为空' });
-  if (IS_VERCEL) { try { const fresh = await kvGet(); if (fresh) cacheDb = fresh; } catch (e) { /* 同上 */ } }
+  if (IS_VERCEL) { try { const fresh = await kvGetThrottled(30000); if (fresh) cacheDb = fresh; } catch (e) { /* 同上 */ } }
   const db = loadDb();
   if (!db.tgMigrations || typeof db.tgMigrations !== 'object') db.tgMigrations = {};
   if (body.remove) {
@@ -3220,12 +3316,73 @@ app.post('/api/integrations/tg-migrate', async (req, res) => {
   res.json({ ok: true, channel: migChannel, migration: db.tgMigrations[migChannel], alreadyImported: already });
 });
 
+/* 原始 KV 读写（分片恢复中转用，绕开护栏，仅限 restore 流程内部使用） */
+async function kvSetRaw(key, value) {
+  const res = await fetch(`${KV_BASE}/set/${key}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'text/plain' },
+    body: value,
+  });
+  if (!res.ok) throw new Error('KV set ' + key + ' ' + res.status);
+}
+async function kvGetRaw(key) {
+  const res = await fetch(`${KV_BASE}/get/${key}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+  if (!res.ok) throw new Error('KV get ' + key + ' ' + res.status);
+  const data = await res.json();
+  return data.result === undefined ? null : data.result;
+}
+async function kvDelRaw(key) {
+  await fetch(`${KV_BASE}/del/${key}`, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` } }).catch(() => {});
+}
+
+/* 全库恢复·分片上传（密钥与 tg-sync 相同）：备份 gz1 体积超过 Vercel 单请求上限，
+   先逐片存进 KV 临时键，再调 restore-assemble 拼回整库。恢复后须重新部署一次，
+   让所有 serverless 实例丢弃内存里的旧快照。 */
+app.post('/api/integrations/restore-chunk', express.text({ limit: '3mb', type: () => true }), async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const ok = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}`);
+  if (!ok) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const idx = parseInt(req.query.i || '0', 10);
+    const body = String(req.body || '');
+    if (!body) return res.status(400).json({ error: 'empty chunk' });
+    await kvSetRaw('jm_forum_restore_' + idx, body);
+    res.json({ ok: true, i: idx, len: body.length });
+  } catch (e) { res.status(500).json({ error: '分片保存失败：' + e.message }); }
+});
+app.post('/api/integrations/restore-assemble', async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const ok = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}`);
+  if (!ok) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    let raw = '';
+    for (let i = 0; i < 64; i++) {
+      const part = await kvGetRaw('jm_forum_restore_' + i);
+      if (part === null) break;
+      raw += part;
+    }
+    if (!raw.startsWith('gz1:')) return res.status(400).json({ error: 'bad format: chunks do not form a gz1: payload' });
+    const parsed = JSON.parse(require('zlib').gunzipSync(Buffer.from(raw.slice(4), 'base64')).toString('utf8'));
+    if (!parsed || !Array.isArray(parsed.topics) || !Array.isArray(parsed.users)) {
+      return res.status(400).json({ error: 'bad payload: topics/users missing' });
+    }
+    cacheDb = parsed;
+    kvLoadedOk = true;
+    maxTopicsSeen = parsed.topics.length;
+    migrate(cacheDb);
+    const posts = cacheDb.topics.reduce((n, t) => n + (t.posts || []).length, 0);
+    await flushNow();
+    for (let i = 0; i < 64; i++) kvDelRaw('jm_forum_restore_' + i);
+    res.json({ ok: true, topics: cacheDb.topics.length, posts, users: cacheDb.users.length });
+  } catch (e) { res.status(500).json({ error: '恢复失败：' + e.message }); }
+});
+
 /* 全库备份导出（密钥与 tg-sync 相同）：返回 gz1: 压缩全库，供定时备份脚本拉取存档 */
 app.get('/api/integrations/backup', async (req, res) => {
   const secret = process.env.TG_SYNC_SECRET || '';
   const ok = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}`);
   if (!ok) return res.status(401).json({ error: 'unauthorized' });
-  if (IS_VERCEL) { try { const fresh = await kvGet(); if (fresh) cacheDb = fresh; } catch (e) { /* 用现有快照 */ } }
+  if (IS_VERCEL) { try { const fresh = await kvGetThrottled(30000); if (fresh) cacheDb = fresh; } catch (e) { /* 用现有快照 */ } }
   const db = loadDb();
   const packed = 'gz1:' + require('zlib').gzipSync(Buffer.from(JSON.stringify(db), 'utf8')).toString('base64');
   res.type('text/plain').send(packed);
@@ -3258,7 +3415,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.headers['x-sync-secret'] === secret || req.query.secret === secret);
   if (!authOk) return res.status(401).json({ error: 'unauthorized' });
   /* 批量写任务先回源 KV 刷新快照，避免拿实例里的旧数据整库覆盖掉并发写入的新数据 */
-  if (IS_VERCEL) { try { const fresh = await kvGet(); if (fresh) cacheDb = fresh; } catch (e) { /* 刷新失败就用现有快照继续 */ } }
+  if (IS_VERCEL) { try { const fresh = await kvGetThrottled(30000); if (fresh) cacheDb = fresh; } catch (e) { /* 刷新失败就用现有快照继续 */ } }
   const channel = String(process.env.TG_CHANNEL || 'chxpd').replace(/[^A-Za-z0-9_]/g, '');
   if (!channel) return res.status(400).json({ error: '频道未配置' });
   const db = loadDb();

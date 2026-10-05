@@ -287,14 +287,27 @@
   }
 
   function boardTabsHtml(activeSlug) {
-    return `<div class="board-tabs">
-      <a href="/" class="${!activeSlug ? 'active' : ''}">全部</a>
-      ${state.boards.map(b => `
-        <a href="/?board=${esc(b.slug)}" class="${activeSlug === b.slug ? 'active' : ''}">
-          <span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}
-        </a>`).join('')}
-    </div>`;
+    // 忏悔录、吃瓜区是大家最常去的，钉在最前面，手机上不用横滑半天
+    const chips = [
+      `<a href="/" class="${!activeSlug ? 'active' : ''}">全部</a>`,
+      `<a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>`,
+    ];
+    const ordered = [...state.boards.filter(b => b.slug === 'chigua'), ...state.boards.filter(b => b.slug !== 'chigua')];
+    for (const b of ordered) {
+      chips.push(`<a href="/?board=${esc(b.slug)}" class="${activeSlug === b.slug ? 'active' : ''}"><span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}</a>`);
+    }
+    return `<div class="bt-wrap"><div class="board-tabs">${chips.join('')}</div><div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>`;
   }
+
+  // 手机端「全部板块」：默认单行横滑，点开摊成完整网格
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-bt-more]');
+    if (!btn) return;
+    const wrap = btn.closest('.bt-wrap');
+    if (!wrap) return;
+    wrap.classList.toggle('open');
+    btn.textContent = wrap.classList.contains('open') ? '收起 ▴' : '全部板块 ▾';
+  });
 
   function sortTabsHtml(current) {
     return `<div class="sort-tabs">
@@ -522,14 +535,14 @@
     const cur = Math.min(page, pages);
     const buildUrl = (p) => '/boards' + (boardSlug ? `?board=${encodeURIComponent(boardSlug)}` : '') + (p > 1 ? `${boardSlug ? '&' : '?'}page=${p}` : '');
     renderPage(`
-      <div class="board-tabs ch-board-tabs">
+      <div class="bt-wrap"><div class="board-tabs ch-board-tabs">
         <a href="/boards" class="${!boardSlug ? 'active' : ''}">全部</a>
-        ${state.boards.map(b => `
+        <a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>
+        ${[...state.boards.filter(b => b.slug === 'chigua'), ...state.boards.filter(b => b.slug !== 'chigua')].map(b => `
           <a href="/boards?board=${esc(b.slug)}" class="${boardSlug === b.slug ? 'active' : ''}">
             <span class="bd-dot" style="background:${esc(b.color)}"></span>${esc(b.name)}
           </a>`).join('')}
-        <a href="/tag/忏悔室"><span class="bd-dot" style="background:#7c5cd6"></span>忏悔录</a>
-      </div>
+      </div><div class="bt-more-row"><button type="button" class="bt-more" data-bt-more>全部板块 ▾</button></div></div>
       ${pages > 1 ? `<div style="display:flex;justify-content:flex-end;margin:2px 2px 10px">${pager(cur, pages, buildUrl, true)}</div>` : ''}
       ${postListHtml(topics)}
       ${pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : ''}
