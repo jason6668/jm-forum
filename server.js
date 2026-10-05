@@ -853,7 +853,9 @@ app.get('/rss.xml', (req, res) => {
     + `<title>马老师社区 - 最新帖子</title><link>${base}</link><description>马老师社区最新主题订阅</description>`
     + `<language>zh-CN</language>${items}</channel></rss>`);
 });
-/* 🗺️ sitemap.xml：搜索引擎收录（只收录游客可见的 LV1 帖，1 小时缓存） */
+/* 🗺️ sitemap.xml：搜索引擎收录（全部游客可见的 LV1 帖合并在一个 sitemap；1 小时缓存）
+   loc 必须百分号编码（中文裸写不符合 sitemap 规范，校验器/部分引擎会拒）；
+   带 XSL 样式表，浏览器打开渲染成表格而不是一坨 XML 源码 */
 let sitemapCache = { at: 0, xml: '' };
 app.get('/sitemap.xml', (req, res) => {
   if (Date.now() - sitemapCache.at < 3600000 && sitemapCache.xml) {
@@ -870,13 +872,12 @@ app.get('/sitemap.xml', (req, res) => {
     `<url><loc>${base}/lucky</loc><changefreq>daily</changefreq><priority>0.5</priority></url>`,
   ];
   db.topics.slice().sort((a, b) => new Date(b.bumpedAt || b.createdAt) - new Date(a.bumpedAt || a.createdAt))
-    .slice(0, 2000)
     .filter(t => (t.minLevel || 1) <= 1 && !t.deleted)
     .forEach(t => {
       const lastmod = new Date(t.bumpedAt || t.createdAt).toISOString().slice(0, 10);
-      urls.push(`<url><loc>${base}/post/${xmlEsc(t.slug || t.id)}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq><priority>0.6</priority></url>`);
+      urls.push(`<url><loc>${base}/post/${encodeURIComponent(t.slug || t.id)}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq><priority>0.6</priority></url>`);
     });
-  sitemapCache = { at: Date.now(), xml: `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join('')}</urlset>` };
+  sitemapCache = { at: Date.now(), xml: `<?xml version="1.0" encoding="UTF-8"?><?xml-stylesheet type="text/xsl" href="/sitemap.xsl"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join('')}</urlset>` };
   res.type('application/xml; charset=utf-8').send(sitemapCache.xml);
 });
 /* 🔥 24小时热文榜（虎扑式）：24h 内有更新的帖子按热度排序 */

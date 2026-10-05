@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /admin
+
+Sitemap: https://bbs.8818618.xyz/sitemap.xml
