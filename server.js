@@ -285,6 +285,12 @@ function migrate(db) {
   });
 }
 function slugify(str) { return String(str).toLowerCase().replace(/[^\w\u4e00-\u9fa5]+/g, '-').replace(/^-|-$/g, '').slice(0, 80) || 'post'; }
+/* slug 全库唯一：同名标题（含电报同步的服务消息）不得共用一个链接，否则后一篇会被前一篇挡住打不开 */
+function uniqueSlug(base, topics, selfId) {
+  let s = base, n = 1;
+  while (topics.some(t => t.slug === s && t.id !== selfId)) { n += 1; s = base + '-' + n; }
+  return s;
+}
 function nowIso() { return new Date().toISOString(); }
 function id(p = '') { return p + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 /* 会话令牌：256 位真随机（原 id('s') 仅 Math.random+时间戳，熵不足，2026-10-04 升级） */
@@ -871,11 +877,15 @@ app.get('/sitemap.xml', (req, res) => {
     `<url><loc>${base}/guide</loc><changefreq>weekly</changefreq><priority>0.6</priority></url>`,
     `<url><loc>${base}/lucky</loc><changefreq>daily</changefreq><priority>0.5</priority></url>`,
   ];
+  const smSeen = new Set();
   db.topics.slice().sort((a, b) => new Date(b.bumpedAt || b.createdAt) - new Date(a.bumpedAt || a.createdAt))
     .filter(t => (t.minLevel || 1) <= 1 && !t.deleted)
     .forEach(t => {
+      const locSlug = encodeURIComponent(t.slug || t.id);
+      if (smSeen.has(locSlug)) return; /* 历史重名 slug 只收一条，避免 sitemap 出现重复链接 */
+      smSeen.add(locSlug);
       const lastmod = new Date(t.bumpedAt || t.createdAt).toISOString().slice(0, 10);
-      urls.push(`<url><loc>${base}/post/${encodeURIComponent(t.slug || t.id)}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq><priority>0.6</priority></url>`);
+      urls.push(`<url><loc>${base}/post/${locSlug}</loc><lastmod>${lastmod}</lastmod><changefreq>daily</changefreq><priority>0.6</priority></url>`);
     });
   sitemapCache = { at: Date.now(), xml: `<?xml version="1.0" encoding="UTF-8"?><?xml-stylesheet type="text/xsl" href="/sitemap.xsl"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join('')}</urlset>` };
   res.type('application/xml; charset=utf-8').send(sitemapCache.xml);
@@ -977,7 +987,7 @@ app.post('/api/topics', requireAuth, rlTopic, (req, res) => {
   /* 阅读权限：LV1=所有人可见（默认），LV2-LV10=对应等级及以上可看 */
   const ml = Math.max(1, Math.min(10, Math.floor(Number(minLevel) || 1)));
   const topic = {
-    id: topicId, title, slug: slugify(title), boardId: board.id, userId: req.user.id,
+    id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: req.user.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: Array.isArray(tags) ? tags.slice(0, 5) : [], posts: [{ id: id('p'), topicId, userId: req.user.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
     pinned: false, recommended: false, price: Number(price) || 0, closed: false, minLevel: ml,
@@ -1031,7 +1041,7 @@ app.post('/api/integrations/moments', async (req, res) => {
   const title = text.replace(/\s+/g, ' ').slice(0, 28) || '一条动态';
   const body = `【来自「马老师专属聊天」的动态】作者：${author}\n\n${text}${imageUrl ? `\n\n![](${String(imageUrl).slice(0, 500)})` : ''}`;
   const topic = {
-    id: id('tp'), title, slug: slugify(title), boardId: board.id, userId: bot.id,
+    id: id('tp'), title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: ['聊天动态'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
     poll: null, bounty: 0, bestReplyId: null, prefix: '',
@@ -1919,7 +1929,7 @@ app.put('/api/topics/:id', requireAuth, (req, res) => {
     topic.posts[0].editedAt = nowIso();
     topic.posts[0].editedBy = req.user.username;
   }
-  topic.slug = slugify(topic.title);
+  topic.slug = uniqueSlug(slugify(topic.title), db.topics, topic.id);
   saveDb(db);
   res.json(enrichTopic(topic, db));
 });
@@ -2732,7 +2742,7 @@ app.get('/api/cron/daily-news', async (req, res) => {
   const time = nowIso();
   const topicId = id('tp');
   const topic = {
-    id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+    id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: ['每日速报', '吃瓜'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
     pinned: false, recommended: false, price: 0, closed: false,
@@ -2807,7 +2817,7 @@ app.post('/api/integrations/tg-submit', async (req, res) => {
   const time = nowIso();
   const title = content.replace(/\s+/g, ' ').slice(0, 30) || '树洞投稿';
   const topic = {
-    id: id('tp'), title, slug: slugify(title) + '-tg' + Date.now().toString(36), boardId: board.id, userId: bot.id,
+    id: id('tp'), title, slug: uniqueSlug(slugify(title), db.topics) + '-tg' + Date.now().toString(36), boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: [source === 'chat' ? '聊天投稿' : 'TG投稿'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
     poll: null, bounty: 0, bestReplyId: null, prefix: '',
@@ -2844,7 +2854,7 @@ app.post('/api/integrations/tg-post', async (req, res) => {
   const mediaNote = body.photoFileId ? '\n\n🖼 [图片见电报频道原帖]' : (body.videoFileId ? '\n\n🎬 [视频见电报频道原帖]' : '');
   const content = `> 🤖 转自 Telegram 树洞频道，由「树洞投稿机器人」自动同步\n\n${text}${mediaNote}\n\n[查看原帖](https://t.me/${ownChannel}/${tgMid})`;
   const topic = {
-    id: id('tp'), title, slug: slugify(title) + '-' + tgMid, boardId: board.id, userId: bot.id,
+    id: id('tp'), title, slug: uniqueSlug(slugify(title), db.topics) + '-' + tgMid, boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: ['树洞'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
     poll: null, bounty: 0, bestReplyId: null, prefix: '树洞',
@@ -3162,7 +3172,7 @@ app.post('/api/integrations/tg-import', async (req, res) => {
     const title = flat ? flat.slice(0, 30) : '树洞图片投稿';
     const content = `> 🤖 转自 Telegram 频道 @${srcChannel}，由「树洞投稿机器人」自动同步\n\n${p.text}${p.image ? `\n\n![](${p.image})` : ''}\n\n[查看原帖](https://t.me/${srcChannel}/${p.mid})`;
     const topic = {
-      id: id('tp'), title, slug: slugify(title) + '-' + p.mid, boardId: board.id, userId: bot.id,
+      id: id('tp'), title, slug: uniqueSlug(slugify(title), db.topics) + '-' + p.mid, boardId: board.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
       tags: ['频道搬运'], posts: [], pinned: false, recommended: false, price: 0, closed: false, minLevel: 1,
       poll: null, bounty: 0, bestReplyId: null, prefix: '树洞',
@@ -3234,7 +3244,7 @@ app.get('/api/cron/blog-sync', async (req, res) => {
     const time = nowIso();
     const topicId = id('tp');
     db.topics.push({
-      id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+      id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
       tags: ['博客同步'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
       pinned: false, recommended: false, price: 0, closed: false,
@@ -3262,7 +3272,7 @@ app.get('/api/cron/blog-sync', async (req, res) => {
     const time = nowIso();
     const topicId = id('tp');
     db.topics.push({
-      id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+      id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
       tags: ['博客同步'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
       pinned: false, recommended: false, price: 0, closed: false,
@@ -3598,7 +3608,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     if (!Array.isArray(db.tags)) db.tags = [];
     for (const tgName of newTags) if (tgName && !db.tags.some(x => x.name === tgName)) db.tags.push({ id: id('t'), name: tgName });
     db.topics.push({
-      id: topicId, title, slug: slugify(title) + '-' + p.mid, boardId: board.id, userId: bot.id,
+      id: topicId, title, slug: uniqueSlug(slugify(title), db.topics) + '-' + p.mid, boardId: board.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
       tags: newTags, posts: [{ id: id('p'), topicId, userId: bot.id, content: body, createdAt: time, likeCount: 0, postNumber: 1 }],
       pinned: false, recommended: false, price: 0, closed: false,
@@ -3991,7 +4001,7 @@ app.post('/api/cron/trendradar-post', express.json({ limit: '512kb' }), async (r
   const time = nowIso();
   const topicId = id('tp');
   const topic = {
-    id: topicId, title, slug: slugify(title), boardId: board.id, userId: bot.id,
+    id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
     tags: ['AI解读', '吃瓜'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
     pinned: false, recommended: false, price: 0, closed: false,
