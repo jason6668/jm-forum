@@ -170,6 +170,23 @@ function loadDb() {
   cacheDb = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
   return cacheDb;
 }
+
+/* 阅读数批量落盘脉冲（2026-10-06 用户要论坛反应迅速）：读请求只动内存计数，凑满 VIEW_FLUSH_N 或
+   间隔 VIEW_FLUSH_MS 才把整库写回一次。Vercel 无状态函数里内存不保真，极端情况下读数会略回滚，
+   那不过是显示用数字——宁可读数差十几，也不能让每个开贴请求都把整库两分片重写一遍。 */
+let viewPulseCount = 0;
+let viewPulseAt = 0;
+const VIEW_FLUSH_N = 30;
+const VIEW_FLUSH_MS = 120000;
+function bumpViewPulse(db) {
+  const now = Date.now();
+  viewPulseCount++;
+  if (!viewPulseAt) viewPulseAt = now;
+  if (viewPulseCount >= VIEW_FLUSH_N || now - viewPulseAt >= VIEW_FLUSH_MS) {
+    viewPulseCount = 0; viewPulseAt = now;
+    saveDb(db); /* saveDb 自带 1.2s 合并窗口，Vercel 走 kvSet、本地直接写盘 */
+  }
+}
 /* ---- 注册码 ---- */
 function genRegCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去掉易混淆字符 O0I1
@@ -508,9 +525,13 @@ function boot() {
         console.error('KV load failed at boot: serving seed data in-memory only, writes to KV are blocked');
         cacheDb = emptyDb();
       }
+      const bootSig = [cacheDb.topics.length, cacheDb.boards.length, cacheDb.users.length, Object.keys(cacheDb.companyReviews || {}).length, (cacheDb.extraCompanies || []).length].join('/');
       seed(cacheDb);
       migrate(cacheDb);
-      if (kvLoadedOk) await kvSet(cacheDb);
+      /* 冷启动优化：seed/migrate 没实际改动时不再整库回写（旧逻辑每次冷启动都把全库
+         下载→解析→再整库上传一遍，首击多等数秒）；签名变了才落盘持久化迁移结果 */
+      const sigAfter = [cacheDb.topics.length, cacheDb.boards.length, cacheDb.users.length, Object.keys(cacheDb.companyReviews || {}).length, (cacheDb.extraCompanies || []).length].join('/');
+      if (kvLoadedOk && sigAfter !== bootSig) await kvSet(cacheDb);
     } else {
       ensureDb();
       const db = loadDb();
@@ -579,19 +600,64 @@ function userPublic(u) {
 function boardById(db, id) { return db.boards.find(b => b.id === id); }
 function boardBySlug(db, slug) { return db.boards.find(b => b.slug === slug); }
 
-/* TG 评论者专属头像：按名字哈希定色 + 首字，同名同头像、不同人不同样 */
-function tgAvatarUri(name) {
-  const s = String(name || 'TG用户');
-  let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  const hue = h % 360;
-  const ch = ([...s.trim()][0] || 'T').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><rect width='64' height='64' rx='14' fill='hsl(${hue},55%,45%)'/><text x='32' y='43' font-size='30' text-anchor='middle' fill='#ffffff' font-family='sans-serif'>${ch}</text></svg>`;
-  return 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf8').toString('base64');
+/* TG 评论者专属头像：按「身份种子」哈希定色 + 显示名首字，同人跨帖稳定。
+   种子优先用评论者的 TG @handle（导入时从评论页作者链接抓到，真能分人），没有 handle 时退回显示名。
+   区分度拉满（渐变+描边+稳定双点缀），撞色与同首字在他眼里都是「头像长一样」——
+   光靠名字哈希不够，色点/环数也随哈希走，让不同人几乎必不同。
+   老评论没存 handle，同名两人仍会撞（数据硬限）；新导入带 handle 后同名异号头像天然不同。 */
+const AVATAR_HUES = [8, 22, 38, 95, 130, 160, 185, 205, 222, 245, 268, 285, 305, 325, 345];
+const tgAvatarCache = new Map();
+function tgAvatarUri(name, seedKey) {
+  const s = String(name ?? '').trim() || 'TG用户';
+  const seed = String(seedKey ?? '').trim() || s;
+  const cacheKey = seed + '|' + ([...s][0] || 'T');
+  const hit = tgAvatarCache.get(cacheKey);
+  if (hit) return hit;
+  let h1 = 0; for (let i = 0; i < seed.length; i++) h1 = (h1 * 31 + seed.charCodeAt(i)) >>> 0;
+  let h2 = 0; for (let i = seed.length - 1; i >= 0; i--) h2 = (h2 * 37 + seed.charCodeAt(i) + 17) >>> 0;
+  const hue = AVATAR_HUES[h1 % AVATAR_HUES.length];
+  const hue2 = (hue + 24 + (h2 % 48)) % 360;
+  const ch = ([...s][0] || 'T').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const dotCx = 12 + (h2 % 4) * 13;        /* 8/21/34/47 四个落点 */
+  const dots = h2 % 3;                     /* 0-2 个点缀圈 */
+  const ring = h1 % 2 ? `<circle cx='32' cy='32' r='27' fill='none' stroke='rgba(255,255,255,0.35)' stroke-width='2'/>` : '';
+  const dot = dots >= 1 ? `<circle cx='${dotCx}' cy='${dots >= 2 ? 14 : 50}' r='4.5' fill='rgba(255,255,255,0.5)'/>` : '';
+  const dot2 = dots >= 2 ? `<circle cx='${52 - (h1 % 5) * 6}' cy='${52 - (h2 % 3) * 7}' r='3' fill='rgba(255,255,255,0.35)'/>` : '';
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='hsl(${hue},58%,46%)'/><stop offset='100%' stop-color='hsl(${hue2},62%,34%)'/></linearGradient></defs><rect width='64' height='64' rx='16' fill='url(#g)'/>${ring}${dot}${dot2}<text x='32' y='43' font-size='30' text-anchor='middle' fill='#ffffff' font-family='sans-serif'>${ch}</text></svg>`;
+  const uri = 'data:image/svg+xml;base64,' + Buffer.from(svg, 'utf8').toString('base64');
+  if (tgAvatarCache.size > 512) tgAvatarCache.clear();
+  tgAvatarCache.set(cacheKey, uri);
+  return uri;
 }
 
-function enrichTopic(t, db, opts = {}) {
+/* 同名分人小标：只当同一显示名在本帖里确实对应 ≥2 个不同 TG 账号（handle 不同）时才出现，
+   例如「王五·K7」；由 handle 哈希出两位码，同账号跨帖一致。异名、或同名同账号，都不显示，
+   免得人人挂个编号看起来像机器号（用户要的是像真人社区）。老评论没 handle，不参与判定。 */
+function tgHandleCode(handle) {
+  const s = String(handle ?? '').trim().toLowerCase();
+  if (!s) return '';
+  let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  const A = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  return '·' + A[h % A.length] + A[Math.floor(h / A.length) % A.length];
+}
+/* 本帖内「同名多账号」的名字集合：显示名 -> 不同 handle 数 ≥2 才算歧义 */
+function tgAmbiguousNames(posts) {
+  const byName = new Map();
+  for (const p of posts || []) {
+    if (!p || !p.authorName || !p.authorHandle) continue;
+    if (!byName.has(p.authorName)) byName.set(p.authorName, new Set());
+    byName.get(p.authorName).add(String(p.authorHandle).toLowerCase());
+  }
+  const amb = new Set();
+  for (const [n, hs] of byName) if (hs.size >= 2) amb.add(n);
+  return amb;
+}
+
+function enrichTopic(t, db, opts = {}, postView) {
   const board = boardById(db, t.boardId);
   const author = db.users.find(u => u.id === t.userId);
+  const ambNames = tgAmbiguousNames(t.posts);
+  const tagFor = (p) => (p && p.authorName && p.authorHandle && ambNames.has(p.authorName)) ? tgHandleCode(p.authorHandle) : '';
   const lastPost = t.posts[t.posts.length - 1];
   const lastReply = lastPost && lastPost.postNumber > 1 ? db.users.find(u => u.id === lastPost.userId) : null;
   const obj = {
@@ -611,12 +677,12 @@ function enrichTopic(t, db, opts = {}) {
     status: t.status || 'published', anonymous: !!t.anonymous, tgSubmitter: t.tgSubmitter || '',
     dislikedByMe: !!opts.userId && (t.dislikedUsers || []).includes(opts.userId),
     reactions: (() => { const st = {}; for (const e of ['❤️','😂','😮','😢','👏','🔥']) st[e] = { count: ((t.reactions || {})[e] || []).length, mine: !!opts.userId && ((t.reactions || {})[e] || []).includes(opts.userId) }; return st; })(),
-    lastReply: lastReply ? { username: lastReply.username, name: lastPost.authorName || lastReply.name, avatar: lastPost.authorName ? tgAvatarUri(lastPost.authorName) : lastReply.avatar, at: lastPost.createdAt } : null,
+    lastReply: lastReply ? { username: lastReply.username, name: lastPost.authorName || lastReply.name, authorTag: tagFor(lastPost), avatar: lastPost.authorName ? tgAvatarUri(lastPost.authorName, lastPost.authorHandle) : lastReply.avatar, at: lastPost.createdAt } : null,
   };
-  if (opts.withPosts) obj.posts = t.posts.map(p => {
+  if (opts.withPosts) obj.posts = (postView || t.posts).map(p => {
     const au = userPublic(db.users.find(u => u.id === p.userId));
     /* 镜像评论显示原作者名 + 专属头像，不挂机器人名下（用户定） */
-    return { ...p, author: p.authorName && au ? { ...au, name: p.authorName, avatar: tgAvatarUri(p.authorName) } : au, likedByMe: !!opts.userId && (p.likedUsers || []).includes(opts.userId) };
+    return { ...p, author: p.authorName && au ? { ...au, name: p.authorName, authorTag: tagFor(p), avatar: tgAvatarUri(p.authorName, p.authorHandle) } : au, likedByMe: !!opts.userId && (p.likedUsers || []).includes(opts.userId) };
   });
   if (t.anonymous && obj.author) obj.author = { ...obj.author, name: '匿名', username: 'anonymous' };
   return obj;
@@ -818,11 +884,12 @@ app.post('/api/settings', requireAuth, (req, res) => {
 
 /* ================= boards & tags ================= */
 app.get('/api/boards', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=10, s-maxage=30, stale-while-revalidate=120');
   const boards = loadDb().boards.slice().sort((a, b) => (a.weight || 0) - (b.weight || 0));
   res.json(boards);
 });
 
-app.get('/api/tags', (req, res) => res.json(loadDb().tags));
+app.get('/api/tags', (req, res) => { res.set('Cache-Control', 'public, max-age=10, s-maxage=30, stale-while-revalidate=120'); res.json(loadDb().tags); });
 
 /* ================= topics ================= */
 /* 📡 RSS 订阅：最新 30 个主题 */
@@ -894,6 +961,7 @@ app.get('/sitemap.xml', (req, res) => {
 });
 /* 🔥 24小时热文榜（虎扑式）：24h 内有更新的帖子按热度排序 */
 app.get('/api/hot24', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=10, s-maxage=60, stale-while-revalidate=300');
   const db = loadDb();
   const days = Math.max(1, Math.min(30, parseInt(req.query.days) || 1));
   const since = Date.now() - days * 24 * 3600000;
@@ -951,10 +1019,28 @@ app.get('/api/topics/:id', (req, res) => {
   if (need > 1 && viewerLv < need) {
     return res.status(403).json({ error: `该帖子需要 LV${need} 及以上才能查看`, needLevel: need, myLevel: viewerLv });
   }
+  /* 阅读数攒批量再落盘（2026-10-06 用户要论坛秒开）：打开帖子每次都 saveDb 曾让每个读请求在
+     1.2s 后把整库分片重写两库，免费库流量和函数时长都吃在写放大上。改为计数进内存、每 30 次
+     或 120s 到期 db 元数据 flushNow 一次落盘——阅读数差十几条肉眼无感，读请求从此只读不写。 */
   topic.viewCount += 1;
-  saveDb(db);
-  const enriched = enrichTopic(topic, db, { withPosts: true, userId: req.user && req.user.id });
+  bumpViewPulse(db);
+  /* 评论分页（2026-10-06 秒开）：详情只回首屏 40 楼+总数，翻页走 ?postsPage；旧前端不传参仍拿全量（兼容期不翻页的路径，分页上线后前端不再用） */
+  const allPosts = topic.posts || [];
+  const wantsAll = req.query.postsAll === '1' || req.query.postsPage === undefined;
+  const pPage = Math.max(1, parseInt(req.query.postsPage) || 1);
+  const pSize = Math.min(100, Math.max(1, parseInt(req.query.postsPageSize) || 40));
+  const view = wantsAll ? allPosts : allPosts.slice(0, pPage * pSize);
+  const enriched = enrichTopic(topic, db, { withPosts: true, userId: req.user && req.user.id }, view);
+  if (!wantsAll) {
+    enriched.postsTotal = allPosts.length;
+    enriched.postsShown = view.length;
+    enriched.postsHasMore = view.length < allPosts.length;
+  }
   if (req.user) enriched.favorited = (topic.favoritedUsers || []).includes(req.user.id);
+  /* 游客详情走 CDN 短缓存（30s）加速首开；登录态与待审帖不进缓存，避免自己的新评论看不见 */
+  if (!req.user && (!topic.status || topic.status === 'published')) {
+    res.set('Cache-Control', 'public, s-maxage=30, stale-while-revalidate=120');
+  }
   res.json(enriched);
 });
 
@@ -1285,8 +1371,12 @@ function migrateCompanyReviews(db) {
 const COMPANIES_API_URL = (process.env.COMPANIES_API_URL || '').replace(/\/+$/, '');
 const COMPANIES_API_KEY = process.env.COMPANIES_API_KEY || '';
 const _remoteCompanyCache = new Map(); /* id/name -> 行，进程级缓存 */
-async function companiesApi(path, timeoutMs = 12000) {
+const _remoteRespCache = new Map(); /* 远程公司库 GET 响应短缓存（实例级）：反复点击不再每次穿隧道回源 */
+function _remoteRespTtl(p) { return p.startsWith('/meta/') ? 600000 : (p === '/stats' ? 120000 : 60000); }
+async function companiesApi(path, timeoutMs = 8000) {
   if (!COMPANIES_API_URL) return null;
+  const cHit = _remoteRespCache.get(path);
+  if (cHit && Date.now() - cHit.at < _remoteRespTtl(path)) return cHit.data;
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -1295,7 +1385,10 @@ async function companiesApi(path, timeoutMs = 12000) {
       signal: ctl.signal,
     });
     if (!r.ok) return null;
-    return await r.json();
+    const data = await r.json();
+    _remoteRespCache.set(path, { at: Date.now(), data });
+    if (_remoteRespCache.size > 500) _remoteRespCache.delete(_remoteRespCache.keys().next().value);
+    return data;
   } catch (e) { return null; } finally { clearTimeout(t); }
 }
 function _cacheRemoteRow(r) {
@@ -1610,6 +1703,7 @@ app.get('/api/companies', async (req, res) => {
 });
 
 app.get('/api/companies/meta/industries', async (req, res) => {
+  res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=1800');
   const db = loadDb();
   if (COMPANIES_API_URL && !hasNationalCatalog()) {
     const r = await companiesApi('/meta/industries');
@@ -1630,6 +1724,7 @@ app.get('/api/companies/meta/industries', async (req, res) => {
 
 /* 省份 / 风险标签 / 数据看板（全国模式） */
 app.get('/api/companies/meta/provinces', async (req, res) => {
+  res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=1800');
   const db = loadDb();
   if (COMPANIES_API_URL && !hasNationalCatalog()) {
     const r = await companiesApi('/meta/provinces');
@@ -1640,6 +1735,7 @@ app.get('/api/companies/meta/provinces', async (req, res) => {
   res.json([]);
 });
 app.get('/api/companies/meta/tags', async (req, res) => {
+  res.set('Cache-Control', 'public, s-maxage=600, stale-while-revalidate=1800');
   const db = loadDb();
   if (COMPANIES_API_URL && !hasNationalCatalog()) {
     const r = await companiesApi('/meta/tags');
@@ -1650,6 +1746,7 @@ app.get('/api/companies/meta/tags', async (req, res) => {
   res.json([]);
 });
 app.get('/api/companies/stats', async (req, res) => {
+  res.set('Cache-Control', 'public, s-maxage=120, stale-while-revalidate=600');
   const db = loadDb();
   if (COMPANIES_API_URL && !hasNationalCatalog()) {
     const r = await companiesApi('/stats');
@@ -1662,6 +1759,7 @@ app.get('/api/companies/stats', async (req, res) => {
 
 /* 避雷热榜：全国 / 按省份；红黑榜 */
 app.get('/api/companies/hot', async (req, res) => {
+  res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
   const db = loadDb();
   const province = req.query.province || '';
   const type = req.query.type || 'danger'; // danger=强烈避雷榜 / reviews=热议榜 / red=红榜(口碑好)
@@ -3865,11 +3963,15 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       const cid = parseInt(idM[1], 10);
       const aM = seg.match(/tgme_widget_message_author_name[^>]*>([\s\S]{0,160}?)<\/span>/);
       const author = (aM ? tgStripHtml(aM[1]) : '').slice(0, 40) || '匿名';
+      /* 作者 @handle 就在作者名链接的 href 里（https://t.me/<handle>）：这是能真正分人的唯一键，
+         同名不同人靠它区分（头像种子+同名小标），没公开用户名的评论者为空，退回按显示名 */
+      const hM = seg.match(/tgme_widget_message_author_name[^>]*?href="https:\/\/t\.me\/([A-Za-z0-9_]{3,40})"/);
+      const handle = hM ? hM[1] : '';
       const texts = [...seg.matchAll(/tgme_widget_message_text js-message_text"[^>]*>([\s\S]*?)<\/div>/g)].map(x => x[1]);
       const text = texts.length ? tgStripHtml(texts[texts.length - 1]).slice(0, 1500) : '';
       const imgM = seg.match(/tgme_widget_message_photo_wrap[^>]*style="[^"]*background-image:url\('([^']+)'\)/);
       const timeM = seg.match(/<time[^>]*datetime="([^"]+)"/);
-      out.push({ cid, author, text, image: imgM ? imgM[1] : '', at: timeM ? timeM[1] : '' });
+      out.push({ cid, author, handle, text, image: imgM ? imgM[1] : '', at: timeM ? timeM[1] : '' });
     }
     return out;
   };
@@ -3927,8 +4029,9 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       if ((t.tgCommentIds || []).length >= 200) break; /* 单帖评论镜像上限 200 条 */
       const ctime = c.at && !isNaN(new Date(c.at).getTime()) ? new Date(c.at).toISOString() : nowIso();
       const cbody = `${c.text}${c.image ? `\n\n![](${c.image})` : ''}`.trim();
-      /* 评论挂原作者名（用户定：不要看起来全是机器人在评论） */
-      t.posts.push({ id: id('p'), topicId: t.id, userId: bot.id, authorName: String(c.author || 'TG用户').slice(0, 40), content: cbody, createdAt: ctime, likeCount: 0, postNumber: t.posts.length + 1 });
+      /* 评论挂原作者名（用户定：不要看起来全是机器人在评论）；authorHandle/tgCid 一并存下，
+         将来分人、回溯都靠它，老评论没有这两个字段，读侧自动退回按显示名 */
+      t.posts.push({ id: id('p'), topicId: t.id, userId: bot.id, authorName: String(c.author || 'TG用户').slice(0, 40), authorHandle: c.handle ? String(c.handle).slice(0, 40) : '', tgCid: c.cid || 0, content: cbody, createdAt: ctime, likeCount: 0, postNumber: t.posts.length + 1 });
       t.replyCount = (t.replyCount || 0) + 1;
       commentsAdded++;
     }
@@ -3961,13 +4064,18 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     const dayKey = todayStr();
     if (!db.settings.assistDay || db.settings.assistDay.date !== dayKey) db.settings.assistDay = { date: dayKey, count: 0 };
     const cutoff = Date.now() - 72 * 3600 * 1000;
+    /* 真投稿识别：聊天/电报投稿（source 或标签）挂的是机器人名，旧版被「楼主须真人」滤掉，
+       投稿进论坛后永远零评论。搬运帖（source=import）有 TG 评论镜像，不占小助手名额。 */
+    const isSubmission = (t) => t.source === 'chat' || t.source === 'tg'
+      || (Array.isArray(t.tags) && (t.tags.includes('聊天投稿') || t.tags.includes('TG投稿')));
     const candidates = (db.topics || [])
       .filter(t => (t.status || 'published') === 'published' && !t.closed)
       .filter(t => Array.isArray(t.posts) && t.posts.length === 1)
       .filter(t => new Date(t.createdAt).getTime() > cutoff)
       .filter(t => {
         const op = db.users.find(u => u.id === t.posts[0].userId);
-        return op && !BOT_NAMES.has(op.username);
+        if (op && !BOT_NAMES.has(op.username)) return true;
+        return isSubmission(t);
       })
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     const kw = (x) => String(x || '').replace(/[\s#＃【】\[\]《》「」]+/g, ' ').trim().slice(0, 24);
@@ -3980,7 +4088,12 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       const asks = /(怎么|如何|为什么|请教|求助|求推荐|有没有|哪位|咋|吗[？?]?$|[？?])/.test(title + body.slice(0, 60));
       const shares = /(分享|教程|经验|记录|总结|攻略|测评|体验)/.test(title);
       let content;
-      if (asks) content = pick([
+      if (isSubmission(t)) content = pick([
+        '感谢投稿！「' + topicKw + '」先来捧个场，坐等大家伙儿聊聊 🌳',
+        '新投稿一篇，「' + topicKw + '」路过留名，有同感的楼下集合',
+        '投稿收到！「' + topicKw + '」这个话题我先占个前排',
+      ]);
+      else if (asks) content = pick([
         '「' + topicKw + '」这个问题问得好，蹲一个大佬解答，我也想知道 👇',
         '看到标题就点进来了，「' + topicKw + '」正好我也想搞清楚，等楼下高手现身',
         '先占个楼，「' + topicKw + '」有答案了记得踢我一下',
@@ -4000,7 +4113,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       t.replyCount = (t.replyCount || 0) + 1;
       t.bumpedAt = time;
       const opUser = db.users.find(u => u.id === t.posts[0].userId);
-      if (opUser && (opUser.preferences && opUser.preferences.notifyReply) !== false) {
+      if (opUser && !BOT_NAMES.has(opUser.username) && (opUser.preferences && opUser.preferences.notifyReply) !== false) {
         addNotification(db, opUser.id, 'reply', { topicId: t.id, topicTitle: t.title, fromId: helper.id, fromName: helper.name, content: content.slice(0, 80) });
       }
       assisted++;
