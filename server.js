@@ -4049,16 +4049,23 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     let helper = db.users.find(u => u.username === 'jmhelper');
     if (!helper) {
       helper = {
-        id: id('u'), username: 'jmhelper', name: '社区小助手', passwordHash: '',
+        id: id('u'), username: 'jmhelper', name: '阿森', passwordHash: '',
         avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
         checkinCoins: 0, lastCheckin: '', favorites: [],
-        bio: '🤖 社区小助手：负责给新帖子捧场，有事找站长',
-        signature: '新帖别冷场，我先来搭句话', readme: '', contacts: {}, preferences: {},
-        blocked: false, exp: 0, badges: [], title: '官方助手', achievements: {},
+        bio: '社区小助手阿森，专给新帖子捧场，有事喊站长',
+        signature: '新帖别冷场，我第一句', readme: '', contacts: {}, preferences: {},
+        blocked: false, exp: 0, badges: [], title: '', achievements: {},
         checkinCount: 0, following: [],
       };
       db.users.push(helper);
     }
+    /* 人设对齐普通用户（用户定）：彩色首字头像走同一生成器、不挂「官方助手」标签；
+       身份线索只留在账号主页（用户名 jmhelper + 简介写明小助手），评论区里就是个热心老住户的样子。 */
+    helper.name = '阿森';
+    helper.avatar = tgAvatarUri('阿森', 'jmhelper');
+    helper.title = '';
+    helper.bio = '社区小助手阿森，专给新帖子捧场，有事喊站长';
+    helper.signature = '新帖别冷场，我第一句';
     const BOT_NAMES = new Set(['tgbot', 'newsbot', 'blogbot', 'jmhelper']);
     db.settings = db.settings || {};
     const dayKey = todayStr();
@@ -4081,7 +4088,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     const kw = (x) => String(x || '').replace(/[\s#＃【】\[\]《》「」]+/g, ' ').trim().slice(0, 24);
     const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
     for (const t of candidates) {
-      if (assisted >= 2 || db.settings.assistDay.count >= 8) break;
+      if (assisted >= 3 || db.settings.assistDay.count >= 24) break;
       const title = String(t.title || '').trim();
       const body = String((t.posts[0] && t.posts[0].content) || '').replace(/\s+/g, ' ').trim();
       const topicKw = kw(title) || kw(body);
@@ -4089,24 +4096,32 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       const shares = /(分享|教程|经验|记录|总结|攻略|测评|体验)/.test(title);
       let content;
       if (isSubmission(t)) content = pick([
-        '感谢投稿！「' + topicKw + '」先来捧个场，坐等大家伙儿聊聊 🌳',
-        '新投稿一篇，「' + topicKw + '」路过留名，有同感的楼下集合',
-        '投稿收到！「' + topicKw + '」这个话题我先占个前排',
+        '树洞新料？「' + topicKw + '」先听为敬',
+        '新投稿先占个座，这瓜看着不小',
+        '看完标题就进来了，后面细说，蹲着了',
+        '投稿刷到了，前排围观一下 🌳',
+        '这事儿有点意思，评论区交给你们了',
+        '路过留名，有后续记得喊我',
       ]);
       else if (asks) content = pick([
-        '「' + topicKw + '」这个问题问得好，蹲一个大佬解答，我也想知道 👇',
-        '看到标题就点进来了，「' + topicKw + '」正好我也想搞清楚，等楼下高手现身',
-        '先占个楼，「' + topicKw + '」有答案了记得踢我一下',
+        '同问，这个我也卡过，蹲一个大佬',
+        '看到标题进来的，「' + topicKw + '」我也想搞清楚',
+        '先收藏，有答案了我回来抄作业',
+        '蹲一个，懂行的楼下集合 👇',
+        '这个问题问到点子上了，等高手现身',
       ]);
       else if (shares) content = pick([
-        '感谢分享！「' + topicKw + '」先码住慢慢看 📌',
-        '这种实打实的分享最有用了，「' + topicKw + '」收藏了',
-        '楼主辛苦，「' + topicKw + '」写得很实在，先存为敬',
+        '码住慢慢看，这种分享最香',
+        '感谢分享，先给个赞为敬',
+        '实用帖，收藏了再细品',
+        '楼主辛苦，这种实打实的帖最有用了 📌',
       ]);
       else content = pick([
-        '沙发！「' + topicKw + '」这个话题有意思，坐等楼主更新',
-        '前排支持一下，「' + topicKw + '」展开说说呗',
-        '「' + topicKw + '」点进来了，楼主继续，别停 😄',
+        '沙发！这话题我熟，围观一下',
+        '前排，楼主继续别停',
+        '进来听个响，有故事的楼下聊聊',
+        '「' + topicKw + '」展开说说呗',
+        '占个楼，坐等楼主更新 😄',
       ]);
       const time = nowIso();
       t.posts.push({ id: id('p'), topicId: t.id, userId: helper.id, content, createdAt: time, likeCount: 0, postNumber: t.posts.length + 1 });
