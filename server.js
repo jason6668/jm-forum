@@ -206,6 +206,10 @@ function migrate(db) {
   if (!db.boards.find(b => b.slug === 'chigua')) {
     db.boards.push({ id: id('b'), name: '吃瓜区', slug: 'chigua', color: '#ec4899', description: '热点八卦、瓜田速报、真相搬运', topicCount: 0 });
   }
+  /* 📰 马老师专属新闻板块：每日新闻播报的家（2026-10-07 品牌纠正，不再挂吃瓜区） */
+  if (!db.boards.find(b => b.slug === 'news')) {
+    db.boards.push({ id: id('b'), name: '马老师专属新闻', slug: 'news', color: '#0ea5e9', description: '每日早上 8 点自动抓取全网热榜：微博 · 抖音 · 头条 · 虎扑 · 知乎 · 财经 · 科技', topicCount: 0, weight: 15 });
+  }
   /* 公司避雷库 v3（3 万级名录）：
    * - 名录（只读 30000 家，含 125 家真实种子）静态化在 public/data/companies.json，不占主库/KV
    * - 主库只存两样：companyReviews{companyId:[评价]} 与 extraCompanies[]（管理端新增）
@@ -255,10 +259,10 @@ function migrate(db) {
   /* 📰 新闻播报机器人（每日自动抓取热榜发帖） */
   if (!db.users.find(u => u.username === 'newsbot')) {
     db.users.push({
-      id: id('u'), username: 'newsbot', name: '瓜田播报员', passwordHash: '',
+      id: id('u'), username: 'newsbot', name: '马老师专属新闻', passwordHash: '',
       avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
       checkinCoins: 0, lastCheckin: '', favorites: [],
-      bio: '🤖 每天早上 8 点自动播报全网热点，吃瓜不迷路',
+      bio: '📰 马老师专属新闻：每天早上 8 点自动抓取全网热榜整理发帖，微博 · 抖音 · 头条 · 虎扑 · 知乎 · 财经 · 科技一帖看全',
       signature: '', readme: '', contacts: {}, preferences: {},
       blocked: false, exp: 0, badges: [], title: '', achievements: {},
       checkinCount: 0, following: [],
@@ -290,6 +294,38 @@ function migrate(db) {
   }
   /* 板块排序权重：老板块按原顺序 */
   db.boards.forEach((b, i) => { if (typeof b.weight !== 'number') b.weight = (i + 1) * 10; });
+  /* 📰 品牌纠正（一次性，2026-10-07 用户定）：每日新闻播报是「马老师专属新闻」，不是吃瓜区。
+     机器人改名、存量「每日吃瓜速报」系列帖改新标题（日期保留，与新发帖去重口径一致）、
+     移入 news 板块、首帖来源行/结尾行换新文案、两边板块帖数同步校正。只动 newsbot 的该系列帖。 */
+  if (!db.newsRebrandV1) {
+    const bot = db.users.find(u => u.username === 'newsbot');
+    const newsBoard = db.boards.find(b => b.slug === 'news');
+    let renamed = 0, moved = 0;
+    if (bot) {
+      bot.name = '马老师专属新闻';
+      bot.bio = '📰 马老师专属新闻：每天早上 8 点自动抓取全网热榜整理发帖，微博 · 抖音 · 头条 · 虎扑 · 知乎 · 财经 · 科技一帖看全';
+      for (const t of db.topics) {
+        if (t.userId !== bot.id || !t.title || !t.title.includes('每日吃瓜速报')) continue;
+        t.title = t.title.replace('每日吃瓜速报', '马老师专属新闻');
+        renamed++;
+        if (newsBoard && t.boardId !== newsBoard.id) {
+          const oldBoard = db.boards.find(b => b.id === t.boardId);
+          if (oldBoard) oldBoard.topicCount = Math.max(0, (oldBoard.topicCount || 0) - 1);
+          newsBoard.topicCount = (newsBoard.topicCount || 0) + 1;
+          t.boardId = newsBoard.id;
+          moved++;
+        }
+        if (Array.isArray(t.tags)) t.tags = t.tags.map(x => (x === '吃瓜' ? '新闻' : x));
+        const p0 = (t.posts || [])[0];
+        if (p0 && typeof p0.content === 'string') {
+          p0.content = p0.content
+            .replace(/> 🤖 数据来源：([^\n]*?)（TrendRadar 同款聚合），机器人每日早上 8 点自动抓取整理，仅供吃瓜参考。/, '> 📰 数据来源：$1（TrendRadar 同款聚合），由马老师专属新闻每日早上 8 点自动抓取整理。')
+            .replace('🍉 今日份的瓜已送达，欢迎在评论区补充你看到的大瓜～', '📰 今日份新闻已送达，欢迎在评论区补充你看到的热点～');
+        }
+      }
+    }
+    db.newsRebrandV1 = { at: nowIso(), renamed, moved };
+  }
   /* v8 升级：等级体系 / 积分商城 / 打赏悬赏 / 投票 / 成就 / 鸡腿交易 */
   if (!Array.isArray(db.shopItems) || !db.shopItems.length) db.shopItems = seedShop();
   if (!Array.isArray(db.transfers)) db.transfers = [];
@@ -397,6 +433,7 @@ function seed(db) {
     { id: id('b'), name: 'Dev', slug: 'dev', color: '#c084fc', description: '开发者工具与开源项目', topicCount: 0 },
     { id: id('b'), name: '测评', slug: 'review', color: '#22d3ee', description: '产品测评、体验分享', topicCount: 0 },
     { id: id('b'), name: '失业联盟', slug: 'unemployment', color: '#6b7a8f', description: '失业互助、求职交流、转型分享', topicCount: 0 },
+    { id: id('b'), name: '马老师专属新闻', slug: 'news', color: '#0ea5e9', description: '每日早上 8 点自动抓取全网热榜：微博 · 抖音 · 头条 · 虎扑 · 知乎 · 财经 · 科技', topicCount: 0 },
     { id: id('b'), name: '吃瓜区', slug: 'chigua', color: '#ec4899', description: '热点八卦、瓜田速报、真相搬运', topicCount: 0 },
   ];
 
@@ -3277,7 +3314,7 @@ async function pushTelegram(sections, dateTag) {
   const token = process.env.TELEGRAM_BOT_TOKEN, chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return { ok: false, reason: '未配置 TG' };
   const chunks = [];
-  let cur = `<b>📰 每日吃瓜速报 · ${escHtml(dateTag)}</b>\n`;
+  let cur = `<b>📰 马老师专属新闻 · ${escHtml(dateTag)}</b>\n`;
   for (const s of sections) {
     let block = `\n<b>${s.emoji} ${escHtml(s.name)}</b>\n`;
     s.items.forEach((x, i) => { block += `${i + 1}. <a href="${x.url}">${escHtml(x.title)}</a>\n`; });
@@ -3303,7 +3340,7 @@ app.get('/api/cron/daily-news', async (req, res) => {
   const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
   if (!authOk) return res.status(401).json({ error: 'unauthorized' });
   const db = loadDb();
-  const board = db.boards.find(b => b.slug === 'chigua') || db.boards[0];
+  const board = db.boards.find(b => b.slug === 'news') || db.boards[0];
   const bot = db.users.find(u => u.username === 'newsbot');
   if (!bot || !board) return res.status(500).json({ error: '机器人或板块未就绪' });
   /* 北京时间日期 */
@@ -3311,7 +3348,7 @@ app.get('/api/cron/daily-news', async (req, res) => {
   const M = now.getUTCMonth() + 1, D = now.getUTCDate();
   const week = ['日', '一', '二', '三', '四', '五', '六'][now.getUTCDay()];
   const dateTag = `${M}月${D}日`;
-  const title = `📰 每日吃瓜速报 · ${dateTag}`;
+  const title = `📰 马老师专属新闻 · ${dateTag}`;
   /* 当天已发过就跳过 */
   if (db.topics.some(t => t.userId === bot.id && t.title === title)) return res.json({ ok: true, skipped: true, reason: '今日已播报' });
   const results = await Promise.all(NEWS_SOURCES.map(async s => ({ ...s, items: (await getNewsNow(s.id)).slice(0, s.n) })));
@@ -3321,15 +3358,15 @@ app.get('/api/cron/daily-news', async (req, res) => {
     return `\n## ${s.emoji} ${s.name}\n\n${lines.join('\n')}\n`;
   };
   const srcNames = results.filter(s => s.items.length).map(s => s.name).join(' · ');
-  const content = `> 🤖 数据来源：${srcNames}（TrendRadar 同款聚合），机器人每日早上 8 点自动抓取整理，仅供吃瓜参考。\n`
+  const content = `> 📰 数据来源：${srcNames}（TrendRadar 同款聚合），由马老师专属新闻每日早上 8 点自动抓取整理。\n`
     + results.map(sec).join('')
-    + `\n---\n🍉 今日份的瓜已送达，欢迎在评论区补充你看到的大瓜～`;
+    + `\n---\n📰 今日份新闻已送达，欢迎在评论区补充你看到的热点～`;
   const time = nowIso();
   const topicId = id('tp');
   const topic = {
     id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
-    tags: ['每日速报', '吃瓜'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+    tags: ['每日速报', '新闻'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
     pinned: false, recommended: false, price: 0, closed: false,
     poll: null, bounty: 0, bestReplyId: null,
     prefix: '速报',
@@ -4632,7 +4669,7 @@ app.post('/api/cron/trendradar-post', express.json({ limit: '512kb' }), async (r
   const { title, content, prefix } = req.body || {};
   if (!title || !content) return res.status(400).json({ error: 'title/content 必填' });
   const db = loadDb();
-  const board = db.boards.find(b => b.slug === 'chigua') || db.boards[0];
+  const board = db.boards.find(b => b.slug === 'news') || db.boards.find(b => b.slug === 'chigua') || db.boards[0];
   const bot = db.users.find(u => u.username === 'newsbot');
   if (!bot || !board) return res.status(500).json({ error: '机器人或板块未就绪' });
   if (db.topics.some(t => t.userId === bot.id && t.title === title)) return res.json({ ok: true, skipped: true, reason: '已存在' });
@@ -4641,7 +4678,7 @@ app.post('/api/cron/trendradar-post', express.json({ limit: '512kb' }), async (r
   const topic = {
     id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
     createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
-    tags: ['AI解读', '吃瓜'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+    tags: ['AI解读', '新闻'], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
     pinned: false, recommended: false, price: 0, closed: false,
     poll: null, bounty: 0, bestReplyId: null,
     prefix: prefix || 'AI解读',
@@ -4807,7 +4844,8 @@ const BOARD_WELCOME_TEMPLATES = {
   dev: { scope: '开发者工具、开源项目与效率神器分享，作者自荐也欢迎。', demo: '《开源了一个 API 请求调试工具，求拍砖》：写清解决什么问题 + 仓库链接', rules: '推广自家项目请注明作者身份；只贴链接不写介绍的会被折叠处理。' },
   review: { scope: '数码产品、软件服务与各类消费体验的真实测评。', demo: '《某机械键盘用了两周：优缺点都在这》（优缺点分开列，结论给明确人群建议）', rules: '请注明是否自费购买；厂商邀约测评必须在文首标注，避免恰饭不标。' },
   unemployment: { scope: '失业互助、求职交流与转型分享，抱团取暖、互相介绍机会。', demo: '标题写清城市与方向，如《重庆 · 3 年运维 · 求内推》；招聘帖请注明公司与薪资范围', rules: '禁止收费培训与「交钱入职」类广告；简历请打码隐私信息。' },
-  chigua: { scope: '热点八卦与瓜田速报。官方号「瓜田播报员」每日早 8 点自动同步全网速报，其余时间大家补瓜。', demo: '标题把瓜说清，来源链接放正文，如《某公司年会抽奖翻车，现场视频来了》', rules: '吃瓜不信谣不传谣；涉及个人隐私的内容请打码，公司类爆料欢迎移步避雷库留证。' },
+  chigua: { scope: '热点八卦与瓜田速报，大家来补瓜的地方（每日全网热榜速报在「马老师专属新闻」板块，这里专供讨论与爆料）。', demo: '标题把瓜说清，来源链接放正文，如《某公司年会抽奖翻车，现场视频来了》', rules: '吃瓜不信谣不传谣；涉及个人隐私的内容请打码，公司类爆料欢迎移步避雷库留证。' },
+  news: { scope: '官方号「马老师专属新闻」每日早上 8 点自动抓取全网热榜整理发帖：微博热搜 · 抖音热点 · 今日头条 · 虎扑热搜 · 知乎热榜 · 财经快讯 · 科技前沿，一帖看全当日热点。', demo: '本板块由官方号自动播报，想聊某条热点直接在当日新闻帖下回帖即可。', rules: '数据来自公开热榜聚合（TrendRadar 同款）；评论区理性讨论，不信谣不传谣。' },
   fuli: { scope: '羊毛福利、资源分享与网盘互助，好东西大家一起薅。', demo: '请按板块预置模板填写：【福利名称】【领取方式】【有效期】【备注】', rules: '福利过期请回帖说明，避免后来人白跑；禁止引流到外部群聊与付费墙。' },
   'tg-treehole': { scope: '树洞投稿区：聊天树洞频道、电报投稿机器人与论坛投稿审核通过后，都会同步到这里（广告已过滤）。', demo: '投稿方式：聊天里找树洞频道投稿 / 电报私聊投稿机器人 / 直接在本板块发帖（普通用户发帖先经管理审核）；想匿名请按投稿向导选择匿名。', rules: '禁止广告与引流；内容同步遵循「搬移帖即原文」原则，不加来源备注行。' },
   blog: { scope: '马老师博客新文章的自动同步区，由官方号自动搬运，原文更新这里也会跟着更新。', demo: '本板块由机器人同步，读完想讨论直接在本帖回帖，或去博客原文下留言。', rules: '本板块不接收手动发帖选题，日常讨论请去对应板块。' },
