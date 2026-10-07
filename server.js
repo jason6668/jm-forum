@@ -1223,6 +1223,9 @@ app.get('/api/topics', (req, res) => {
   const blockedIds = blockedUserIds(db, req.user);
   if (blockedIds) topics = topics.filter(t => !blockedIds.has(t.userId));
   const { board, sort, tag, mine, following } = req.query;
+  /* 板块官方说明帖（boardSeed 标记）：是「板块说明书」，只在对应板块页出现；
+     首页/关注/标签/推荐等聚合流一律排除（搜索 /api/search 保留）。过滤在分页之前，total 口径一致 */
+  if (!board) topics = topics.filter(t => !t.boardSeed);
   if (following) {
     if (!req.user) topics = [];
     else { const f = new Set(req.user.following || []); topics = topics.filter(t => f.has(t.userId)); }
@@ -4794,7 +4797,7 @@ app.post('/api/cron/sports-seed', express.json({ limit: '512kb' }), async (req, 
   res.json({ ok: true, day, created, boards, fetched });
 });
 
-/* ---------- 板块官方说明帖（置顶）：一板块 1 篇、幂等（seedKey = welcome:<slug>） ----------
+/* ---------- 板块官方说明帖（置顶）：一板块 1 篇、幂等（以 boardSeed 标记为准，seedKey=welcome:<slug> 兼容旧帖补标记） ----------
  * 模板写法统一为「聊什么 / 发帖示范 / 版规」官方口吻；不模仿真人经历、不编造用户故事。 */
 const BOARD_WELCOME_TEMPLATES = {
   daily: { scope: '聊天灌水、生活日常、吃喝玩乐、心情记录，好坏消息都能来唠两句。', demo: '《今天楼下新开的面馆，味道绝了》《下班路上的晚霞，拍给你们看》（标题把事说清就行，配图更欢迎）', rules: '不刷屏连发、不人身攻击；广告与交易请移步「交易」板块。' },
@@ -4843,10 +4846,18 @@ app.post('/api/cron/board-seed', express.json({ limit: '64kb' }), async (req, re
   const wanted = Array.isArray(req.body && req.body.slugs) ? req.body.slugs.map(s => String(s)) : null;
   const boards = {};
   let created = 0;
+  let marked = 0;
   for (const board of db.boards) {
     if (wanted && !wanted.includes(board.slug)) continue;
     const seedKey = `welcome:${board.slug}`;
-    if (db.topics.some(t => t.seedKey === seedKey)) { boards[board.slug] = 'exists'; continue; }
+    /* 幂等口径：该板块已有 boardSeed 标记帖即视为已有说明帖。
+       兼容线上已发的旧帖：它们带 seedKey 但还没有 boardSeed 标记，这里只补标记不重复发帖。 */
+    const existing = db.topics.find(t => t.boardId === board.id && (t.boardSeed === true || t.seedKey === seedKey));
+    if (existing) {
+      if (!existing.boardSeed) { existing.boardSeed = true; existing.seedKey = existing.seedKey || seedKey; boards[board.slug] = 'marked'; marked++; }
+      else boards[board.slug] = 'exists';
+      continue;
+    }
     if (onlyEmpty && (board.topicCount || 0) > 0) { boards[board.slug] = 'skipped-nonempty'; continue; }
     const time = nowIso();
     const topicId = id('tp');
@@ -4856,14 +4867,14 @@ app.post('/api/cron/board-seed', express.json({ limit: '64kb' }), async (req, re
       tags: ['公告'], posts: [{ id: id('p'), topicId, userId: helper.id, content: boardWelcomeContent(board), createdAt: time, likeCount: 0, postNumber: 1 }],
       pinned: true, recommended: false, price: 0, closed: false,
       poll: null, bounty: 0, bestReplyId: null,
-      prefix: '官方', status: 'published', seedKey,
+      prefix: '官方', status: 'published', seedKey, boardSeed: true,
     });
     board.topicCount = (board.topicCount || 0) + 1;
     boards[board.slug] = 'created';
     created++;
   }
-  if (created) { saveDb(db); await flushNow(); }
-  res.json({ ok: true, created, boards });
+  if (created || marked) { saveDb(db); await flushNow(); }
+  res.json({ ok: true, created, marked, boards });
 });
 
 /* ================= 热点专区 TrendRadar 报告 ================= */
