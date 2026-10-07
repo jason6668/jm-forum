@@ -4649,6 +4649,223 @@ app.post('/api/cron/trendradar-post', express.json({ limit: '512kb' }), async (r
   res.json({ ok: true, topicId });
 });
 
+/* ================= 🏟️ 空板块内容生态一期：体育每日同步 + 板块官方说明（明牌官方，不造假真人） =================
+ * 口径（用户定）：种子帖一律官方号发帖、标题/正文标注来源，由外部 cron 推送或触发。
+ * - 体育发帖号：sportbot「体育快讯」（照 newsbot 先例单独建号，主页标明自动同步资讯）。
+ * - 板块说明发帖号：jmhelper「阿森」（已有官方小助手），说明帖置顶、提名官方。
+ * 鉴权与 tg-sync 同口径：x-sync-secret 头 / Bearer / ?secret= 均可（TG_SYNC_SECRET）。
+ * 幂等：体育帖带 seedKey = sports:<北京时间日期>:<板块slug>，同板块同日不重发；
+ *       说明帖带 seedKey = welcome:<板块slug>，一板块一篇不重发。 */
+
+/* 体育板块清单与标题梗图（slug 与 migrate 里的 SPORT_BOARDS 对齐）。
+   分类映射表（可改）：按数组顺序先匹配更垂直的项目，最后 football/basketball 两大球，
+   都不命中再按综合体育兜底词判断。关键词按标题子串匹配（英文转小写后比对）。 */
+const SPORT_BOARD_EMOJI = { basketball: '🏀', football: '⚽', tennis: '🎾', badminton: '🏸', pingpong: '🏓', volleyball: '🏐', billiards: '🎱', baseball: '⚾', golf: '⛳', esports: '🎮', sports: '🏅' };
+const SPORT_SLUG_ORDER = ['basketball', 'football', 'tennis', 'badminton', 'pingpong', 'volleyball', 'billiards', 'baseball', 'golf', 'esports', 'sports'];
+const SPORT_BOARD_KEYWORDS = [
+  ['pingpong', ['乒乓球', '乒联', '世乒赛', 'wtt', '马龙', '樊振东', '孙颖莎', '王楚钦', '陈梦', '林诗栋']],
+  ['billiards', ['台球', '斯诺克', '奥沙利文', '丁俊晖', '赵心童', '中式八球', '九球']],
+  ['badminton', ['羽毛球', '苏迪曼杯', '汤姆斯杯', '尤伯杯', '陈雨菲', '安赛龙', '石宇奇']],
+  ['tennis', ['网球', '温网', '美网', '法网', '澳网', 'atp', 'wta', '郑钦文', '德约科维奇', '阿尔卡拉斯', '辛纳']],
+  ['volleyball', ['排球', '女排', '男排', '朱婷', '袁心玥', '李盈莹']],
+  ['baseball', ['棒球', 'mlb', '大谷翔平', '道奇队', '洋基', '世界棒球经典赛']],
+  ['golf', ['高尔夫', 'pga', '麦克罗伊', '伍兹']],
+  ['esports', ['电竞', '英雄联盟', 'lol', 'lpl', 'msi', 's赛', 'cs2', 'dota2', '王者荣耀', 'kpl', '无畏契约', '永劫无间', 'edg', 'blg', 'tes', 'jdg', 'wbg', 'fpx']],
+  ['basketball', ['nba', 'cba', 'wnba', '篮球', '湖人', '勇士', '凯尔特人', '掘金', '雄鹿', '太阳', '快船', '尼克斯', '篮网', '76人', '热火', '独行侠', '森林狼', '雷霆队', '骑士', '火箭队', '马刺', '詹姆斯', '库里', '杜兰特', '字母哥', '约基奇', '东契奇', '恩比德', '塔图姆', '男篮', '女篮', '周琦', '杨瀚森']],
+  ['football', ['足球', '中超', '英超', '西甲', '意甲', '德甲', '法甲', '欧冠', '世界杯', '欧洲杯', '美洲杯', '亚洲杯', '国足', '皇马', '巴萨', '巴塞罗那', '曼城', '利物浦', '阿森纳', '曼联', '切尔西', '拜仁', '巴黎圣日耳曼', '梅西', 'c罗', '克里斯蒂亚诺', '姆巴佩', '哈兰德', '内马尔', '亚冠', '足协杯', '武磊']],
+];
+/* 综合体育兜底：只命中大词时进综合体育板 */
+const SPORT_GENERIC_KEYWORDS = ['体育', '奥运', '亚运', '世锦赛', '锦标赛', '世界杯', '国家队', '运动员', '田径', '游泳', 'f1', '赛车', '健身', '马拉松', '拳击', '格斗', 'ufc', '滑雪', '短道速滑'];
+const SPORT_FEED_SOURCES = [
+  { id: 'hupu', emoji: '🏀', name: '虎扑', n: 30 },
+  { id: 'weibo', emoji: '🔥', name: '微博热搜', n: 30 },
+  { id: 'toutiao', emoji: '📰', name: '今日头条', n: 30 },
+];
+function classifySportTitle(rawTitle) {
+  const t = String(rawTitle || '').toLowerCase();
+  if (!t) return '';
+  for (const [slug, kws] of SPORT_BOARD_KEYWORDS) if (kws.some(k => t.includes(k))) return slug;
+  if (SPORT_GENERIC_KEYWORDS.some(k => t.includes(k))) return 'sports';
+  return '';
+}
+/* 入参归一：{items:[{board|boardSlug|slug,title,url}]} 或 {feeds:{<slug>:[{title,url}]}} */
+function normalizeSportsItems(body) {
+  const out = [];
+  const pushOne = (boardSlug, x) => {
+    const title = String((x && x.title) || '').trim();
+    if (!title) return;
+    out.push({ boardSlug: String(boardSlug || '').trim(), title, url: String((x && x.url) || '').trim() });
+  };
+  if (body && Array.isArray(body.items)) body.items.forEach(x => x && pushOne(x.boardSlug || x.board || x.slug || '', x));
+  if (body && body.feeds && typeof body.feeds === 'object') for (const [slug, list] of Object.entries(body.feeds)) if (Array.isArray(list)) list.forEach(x => pushOne(slug, x));
+  return out.slice(0, 500);
+}
+function ensureSportBot(db) {
+  let bot = db.users.find(u => u.username === 'sportbot');
+  if (!bot) {
+    bot = {
+      id: id('u'), username: 'sportbot', name: '体育快讯', passwordHash: '',
+      avatar: '', createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
+      checkinCoins: 0, lastCheckin: '', favorites: [],
+      bio: '🤖 体育板块自动同步资讯：每日整理虎扑/热榜体育热点（NewsNow 聚合，与 TrendRadar 同源），明牌机器人，非真人。',
+      signature: '', readme: '', contacts: {}, preferences: {},
+      blocked: false, exp: 0, badges: [], title: '', achievements: {},
+      checkinCount: 0, following: [],
+    };
+    db.users.push(bot);
+  }
+  if (!bot.avatar) bot.avatar = tgAvatarUri('体', 'sportbot'); /* 与树洞评论同款：按用户名上色的首字头像 */
+  return bot;
+}
+function ensureHelper(db) {
+  let helper = db.users.find(u => u.username === 'jmhelper');
+  if (!helper) {
+    helper = {
+      id: id('u'), username: 'jmhelper', name: '阿森', passwordHash: '',
+      avatar: tgAvatarUri('阿', 'jmhelper'), createdAt: nowIso(), trustLevel: 1, role: 'user', coins: 0,
+      checkinCoins: 0, lastCheckin: '', favorites: [],
+      bio: '社区小助手阿森，专给新帖子捧场，有事喊站长',
+      signature: '新帖别冷场，我第一句', readme: '', contacts: {}, preferences: {},
+      blocked: false, exp: 0, badges: [], title: '', achievements: {},
+      checkinCount: 0, following: [],
+    };
+    db.users.push(helper);
+  }
+  return helper;
+}
+/* 体育同步：把当日体育热点按板块各发 1 帖（每个板块每天最多 1 帖）。无数据静默跳过、零写入。 */
+app.post('/api/cron/sports-seed', express.json({ limit: '512kb' }), async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const authOk = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  if (IS_VERCEL) { try { const fresh = await kvGetThrottled(30000); if (fresh) cacheDb = fresh; } catch (e) { /* 刷新失败就用现有快照继续 */ } }
+  const db = loadDb();
+  migrate(db); /* 本地裸跑/新库时板块与官方号在此补齐（Vercel 下 boot 已跑过，重复调用无副作用） */
+  const bot = ensureSportBot(db);
+  const day = todayStr(new Date(Date.now() + 8 * 3600 * 1000)); /* 北京时间日期 */
+  const dateTag = `${Number(day.slice(5, 7))}月${Number(day.slice(8, 10))}日`;
+  let items = normalizeSportsItems(req.body || {});
+  const fetched = {};
+  if (!items.length) {
+    /* 未带数据：服务端自抓 NewsNow 体育相关热榜（与每日新闻同一通道） */
+    const results = await Promise.all(SPORT_FEED_SOURCES.map(async s => ({ ...s, items: (await getNewsNow(s.id)).slice(0, s.n) })));
+    for (const s of results) { fetched[s.id] = s.items.length; items.push(...s.items.map(x => ({ boardSlug: '', title: x.title, url: x.url }))); }
+  }
+  if (!items.length) return res.json({ ok: true, day, created: 0, boards: {}, fetched, skipped: true, reason: '无当日体育数据' });
+  /* 按板块归类：显式标注的认其标注（必须是体育板），否则按关键词分类 */
+  const validSlugs = new Set(SPORT_SLUG_ORDER);
+  const groups = new Map();
+  for (const it of items) {
+    const slug = validSlugs.has(it.boardSlug) ? it.boardSlug : classifySportTitle(it.title);
+    if (!slug) continue;
+    if (!groups.has(slug)) groups.set(slug, []);
+    const arr = groups.get(slug);
+    if (arr.length < 8 && !arr.some(x => x.title === it.title)) arr.push(it); /* 每帖最多 8 条、按标题去重 */
+  }
+  /* 零帖板块优先：按现存帖数升序处理（每板同日仍只 1 帖，上限逻辑不变） */
+  const entries = [...groups.entries()].map(([slug, arr]) => {
+    const board = db.boards.find(b => b.slug === slug);
+    return board ? { slug, board, arr } : null;
+  }).filter(Boolean).sort((a, b) => (a.board.topicCount || 0) - (b.board.topicCount || 0));
+  const boards = {};
+  let created = 0;
+  for (const { slug, board, arr } of entries) {
+    const seedKey = `sports:${day}:${slug}`;
+    if (db.topics.some(t => t.seedKey === seedKey)) { boards[slug] = 'exists'; continue; }
+    const emoji = SPORT_BOARD_EMOJI[slug] || '🏅';
+    const title = `${emoji} ${board.name}今日热点 · ${dateTag}`;
+    const lines = arr.map((x, i) => `${i + 1}. ${x.url ? `[${x.title}](${x.url})` : x.title}`);
+    const content = `> 🤖 自动同步体育资讯：内容聚合自${fetched.hupu !== undefined ? ' 虎扑/微博/头条热榜（NewsNow 聚合，与 TrendRadar 同源）' : '外部推送的当日体育热点'}，由官方机器人「体育快讯」自动同步整理，非真人发帖，仅供球迷交流。\n\n## ${emoji} 今日${board.name}热点\n\n${lines.join('\n')}\n\n---\n📌 本板块每天自动同步 1 篇热点，其余时间欢迎真人发帖：聊比赛、评球员、发战报、约球都行。`;
+    const time = nowIso();
+    const topicId = id('tp');
+    db.topics.push({
+      id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
+      createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+      tags: ['体育资讯', board.name], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+      pinned: false, recommended: false, price: 0, closed: false,
+      poll: null, bounty: 0, bestReplyId: null,
+      prefix: '体育', status: 'published', seedKey,
+    });
+    board.topicCount = (board.topicCount || 0) + 1;
+    boards[slug] = 'created';
+    created++;
+  }
+  if (created) { saveDb(db); await flushNow(); }
+  res.json({ ok: true, day, created, boards, fetched });
+});
+
+/* ---------- 板块官方说明帖（置顶）：一板块 1 篇、幂等（seedKey = welcome:<slug>） ----------
+ * 模板写法统一为「聊什么 / 发帖示范 / 版规」官方口吻；不模仿真人经历、不编造用户故事。 */
+const BOARD_WELCOME_TEMPLATES = {
+  daily: { scope: '聊天灌水、生活日常、吃喝玩乐、心情记录，好坏消息都能来唠两句。', demo: '《今天楼下新开的面馆，味道绝了》《下班路上的晚霞，拍给你们看》（标题把事说清就行，配图更欢迎）', rules: '不刷屏连发、不人身攻击；广告与交易请移步「交易」板块。' },
+  info: { scope: '行业动态、公司消息、政策变化与各类热点情报，讲究一个快和准。', demo: '标题尽量带时间与主体，如《10月7日：某云厂商宣布涨价》（附信息源链接更佳）', rules: '未证实的消息请在标题注明「网传」；搬运请注明出处，不造谣不传谣。' },
+  tech: { scope: '网络、服务器、运维与编程技术交流，问题互助与经验贴都欢迎。', demo: '《VPS 一键测速脚本分享》《Docker 部署某服务踩坑记录》', rules: '提问请贴完整报错日志与环境版本；禁止发布无授权的破解与侵权资源。' },
+  trade: { scope: 'VPS、域名、账号与各类闲置物品的买卖求购。', demo: '标题格式：【出售】/【求购】+ 物品 + 价格，如《【出售】海外 VPS 一台，月付 30》', rules: '必须标明价格与支付方式；交易走站内私信留痕，先款交易有风险，建议先看站内《交易安全》再下单，谨防诈骗。' },
+  dev: { scope: '开发者工具、开源项目与效率神器分享，作者自荐也欢迎。', demo: '《开源了一个 API 请求调试工具，求拍砖》：写清解决什么问题 + 仓库链接', rules: '推广自家项目请注明作者身份；只贴链接不写介绍的会被折叠处理。' },
+  review: { scope: '数码产品、软件服务与各类消费体验的真实测评。', demo: '《某机械键盘用了两周：优缺点都在这》（优缺点分开列，结论给明确人群建议）', rules: '请注明是否自费购买；厂商邀约测评必须在文首标注，避免恰饭不标。' },
+  unemployment: { scope: '失业互助、求职交流与转型分享，抱团取暖、互相介绍机会。', demo: '标题写清城市与方向，如《重庆 · 3 年运维 · 求内推》；招聘帖请注明公司与薪资范围', rules: '禁止收费培训与「交钱入职」类广告；简历请打码隐私信息。' },
+  chigua: { scope: '热点八卦与瓜田速报。官方号「瓜田播报员」每日早 8 点自动同步全网速报，其余时间大家补瓜。', demo: '标题把瓜说清，来源链接放正文，如《某公司年会抽奖翻车，现场视频来了》', rules: '吃瓜不信谣不传谣；涉及个人隐私的内容请打码，公司类爆料欢迎移步避雷库留证。' },
+  fuli: { scope: '羊毛福利、资源分享与网盘互助，好东西大家一起薅。', demo: '请按板块预置模板填写：【福利名称】【领取方式】【有效期】【备注】', rules: '福利过期请回帖说明，避免后来人白跑；禁止引流到外部群聊与付费墙。' },
+  'tg-treehole': { scope: '树洞投稿区：聊天树洞频道、电报投稿机器人与论坛投稿审核通过后，都会同步到这里（广告已过滤）。', demo: '投稿方式：聊天里找树洞频道投稿 / 电报私聊投稿机器人 / 直接在本板块发帖（普通用户发帖先经管理审核）；想匿名请按投稿向导选择匿名。', rules: '禁止广告与引流；内容同步遵循「搬移帖即原文」原则，不加来源备注行。' },
+  blog: { scope: '马老师博客新文章的自动同步区，由官方号自动搬运，原文更新这里也会跟着更新。', demo: '本板块由机器人同步，读完想讨论直接在本帖回帖，或去博客原文下留言。', rules: '本板块不接收手动发帖选题，日常讨论请去对应板块。' },
+  moments: { scope: '马老师专属聊天里发布的动态，自动同步到这里，方便论坛朋友围观。', demo: '本板块为自动同步，想发动态请去聊天站发布，这里以围观和回帖为主。', rules: '动态内容归原作者，请勿搬运到站外。' },
+  basketball: { scope: 'NBA、CBA 与野球场：聊球、看球、评球，赛后战报最受欢迎。', demo: '《昨晚野球场被虐惨了，但过人那下我自己都惊了》《湖人这波五连胜含金量如何》', rules: '理性评球不引战；官方号「体育快讯」每日自动同步 1 篇篮球热点。' },
+  football: { scope: '五大联赛、中超、欧冠与世界杯：世界第一运动，懂球帝集合。', demo: '《欧冠之夜：这场绝杀我能吹一年》', rules: '理性评球不引战；官方号「体育快讯」每日自动同步 1 篇足球热点。' },
+  tennis: { scope: '四大满贯、ATP 与 WTA，网球爱好者的地盘。', demo: '《郑钦文这站状态，感觉要冲决赛了》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇网球热点。' },
+  badminton: { scope: '苏迪曼杯、汤尤杯与世锦赛，国羽比赛日这里最热闹。', demo: '《汤杯决赛夜：第二单打这分拿得太关键了》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇羽毛球热点。' },
+  pingpong: { scope: 'WTT 与世乒赛，国球专区，乒坛动态与民间球局都聊。', demo: '《王楚钦 vs 林诗栋这场，打出了近几年最好看的相持》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇乒乓球热点。' },
+  volleyball: { scope: '中国女排、男排与各大联赛，女排比赛日必开楼。', demo: '《女排联赛这场五局大战，看得手心冒汗》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇排球热点。' },
+  billiards: { scope: '斯诺克、中式八球与九球，杆法与赛事都聊。', demo: '《赵心童这杆围球，思路太清晰了》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇台球热点。' },
+  baseball: { scope: 'MLB、日职棒与世界棒球经典赛，棒球小众但同好不孤单。', demo: '《大谷翔平又双叒叕刷新纪录了》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇棒球热点。' },
+  golf: { scope: '大满贯与 PGA，挥杆人生，装备与球场体验也聊。', demo: '《周末下场记：第一次抓鸟，纪念一下》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇高尔夫热点。' },
+  esports: { scope: 'LOL、CS2、王者荣耀与 DOTA2：比赛复盘、版本讨论、开黑组队。', demo: '《LPL 季后赛这手 BP，把对面算死了》', rules: '理性讨论不引战、不带选手节奏；官方号「体育快讯」每日自动同步 1 篇电竞热点。' },
+  sports: { scope: '田径、游泳、F1 与健身等综合体育，没单独板块的项目都在这。', demo: '《马拉松首马完赛记录：3 小时 58 分》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇综合体育热点。' },
+};
+function boardWelcomeContent(board) {
+  const tpl = BOARD_WELCOME_TEMPLATES[board.slug] || {
+    scope: board.description || '本板块的主题讨论都欢迎。',
+    demo: '标题把主题说清楚，正文写清来龙去脉，配图更欢迎。',
+    rules: '友善交流、不刷屏、不发广告与侵权内容。',
+  };
+  return `> 📌 本帖由社区官方小助手「阿森」代表站方发布并置顶，是「${board.name}」板块的官方说明帖。\n\n## 这里聊什么\n\n${tpl.scope}\n\n## 发帖示范\n\n${tpl.demo}\n\n## 版规\n\n${tpl.rules}\n\n---\n🙌 板块刚起步，欢迎你成为这里的第一批作者：点右上角发帖，把第一篇帖子留在这里。遇到问题随时喊站长。`;
+}
+/* 说明帖落库（幂等）：默认给所有还没有说明帖的板块各发 1 篇置顶；
+   传 ?onlyEmpty=1 时只处理 0 帖板块；传 body.slugs[] 时只处理指定板块。 */
+app.post('/api/cron/board-seed', express.json({ limit: '64kb' }), async (req, res) => {
+  const secret = process.env.TG_SYNC_SECRET || '';
+  const authOk = secret && (req.headers['x-sync-secret'] === secret || req.headers.authorization === `Bearer ${secret}` || req.query.secret === secret);
+  if (!authOk) return res.status(401).json({ error: 'unauthorized' });
+  if (IS_VERCEL) { try { const fresh = await kvGetThrottled(30000); if (fresh) cacheDb = fresh; } catch (e) { /* 刷新失败就用现有快照继续 */ } }
+  const db = loadDb();
+  migrate(db);
+  const helper = ensureHelper(db);
+  const onlyEmpty = String(req.query.onlyEmpty || '') === '1';
+  const wanted = Array.isArray(req.body && req.body.slugs) ? req.body.slugs.map(s => String(s)) : null;
+  const boards = {};
+  let created = 0;
+  for (const board of db.boards) {
+    if (wanted && !wanted.includes(board.slug)) continue;
+    const seedKey = `welcome:${board.slug}`;
+    if (db.topics.some(t => t.seedKey === seedKey)) { boards[board.slug] = 'exists'; continue; }
+    if (onlyEmpty && (board.topicCount || 0) > 0) { boards[board.slug] = 'skipped-nonempty'; continue; }
+    const time = nowIso();
+    const topicId = id('tp');
+    db.topics.push({
+      id: topicId, title: `📌 欢迎来到「${board.name}」：本版说明与发帖示范`, slug: uniqueSlug(slugify(`welcome-${board.slug}`), db.topics), boardId: board.id, userId: helper.id,
+      createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
+      tags: ['公告'], posts: [{ id: id('p'), topicId, userId: helper.id, content: boardWelcomeContent(board), createdAt: time, likeCount: 0, postNumber: 1 }],
+      pinned: true, recommended: false, price: 0, closed: false,
+      poll: null, bounty: 0, bestReplyId: null,
+      prefix: '官方', status: 'published', seedKey,
+    });
+    board.topicCount = (board.topicCount || 0) + 1;
+    boards[board.slug] = 'created';
+    created++;
+  }
+  if (created) { saveDb(db); await flushNow(); }
+  res.json({ ok: true, created, boards });
+});
+
 /* ================= 热点专区 TrendRadar 报告 ================= */
 const TREND_INDEX_KEY = 'trend:index';
 const trendKey = (k) => `trend:report:${k}`;
