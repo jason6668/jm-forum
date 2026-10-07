@@ -709,6 +709,7 @@ function rateLimit(name, { windowMs, max, byUser }) {
 const rlAuth = rateLimit('auth', { windowMs: 10 * 60 * 1000, max: 30 });                 // 登录/注册：同 IP 10 分钟 30 次
 const rlTopic = rateLimit('topic', { windowMs: 60 * 60 * 1000, max: 30, byUser: true });  // 发帖：每用户每小时 30 帖
 const rlReply = rateLimit('reply', { windowMs: 60 * 60 * 1000, max: 200, byUser: true }); // 回复：每用户每小时 200 条
+const rlUpload = rateLimit('upload', { windowMs: 10 * 60 * 1000, max: 20, byUser: true }); // 传图：每用户 10 分钟 20 张
 
 /* ================= auth API ================= */
 app.post('/api/auth/register', rlAuth, async (req, res) => {
@@ -1042,6 +1043,133 @@ app.get('/api/topics/:id', (req, res) => {
     res.set('Cache-Control', 'public, s-maxage=30, stale-while-revalidate=120');
   }
   res.json(enriched);
+});
+
+/* ================= 图片上传（发帖/回复一键传图） =================
+   选路：论坛没有自有图床配置，帖内图片现行就是 TG 外链；这里复用已配置的论坛机器人
+   （TG_BOT_TOKEN）把图片以「文档」形式存进专用存储会话（env IMAGE_TG_CHAT_ID，
+   应为只有机器人和管理员的私密会话/频道，不要填公开频道），拿到 file_id 后
+   由本站 /api/img/:fileId 代理读出。未配置存储会话时接口返回 503，不假装能传。 */
+const IMG_MAX_BYTES = 10 * 1024 * 1024;          // 单张 ≤10MB
+const IMG_TG_BOT_API = 'https://api.telegram.org';
+const IMG_TYPES = [                               // 以文件头魔数判定，不信任前端声明的类型
+  { mime: 'image/jpeg', ext: 'jpg',  test: b => b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF },
+  { mime: 'image/png',  ext: 'png',  test: b => b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47 && b[4] === 0x0D && b[5] === 0x0A && b[6] === 0x1A && b[7] === 0x0A },
+  { mime: 'image/gif',  ext: 'gif',  test: b => b.length > 6 && b.toString('latin1', 0, 6).startsWith('GIF8') },
+  { mime: 'image/webp', ext: 'webp', test: b => b.length > 12 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP' },
+];
+function sniffImageType(buf) { return IMG_TYPES.find(t => t.test(buf)) || null; }
+
+/* 手写单文件 multipart 解析：只取第一个文件字段，避免为传图新增依赖。
+   全局 express.json/urlencoded 不处理 multipart，这里的原始流未被消费过。 */
+function readMultipartFile(req) {
+  return new Promise((resolve, reject) => {
+    const ctype = String(req.headers['content-type'] || '');
+    const bm = ctype.match(/multipart\/form-data\s*;.*boundary=(?:"([^"]+)"|([^;]+))/i);
+    if (!bm) return reject(Object.assign(new Error('请求格式不正确'), { status: 400 }));
+    const boundary = Buffer.from('--' + (bm[1] || bm[2]).trim(), 'latin1');
+    const declared = Number(req.headers['content-length'] || 0);
+    if (declared > IMG_MAX_BYTES + 1024 * 1024) {
+      return reject(Object.assign(new Error('图片大小不能超过 10MB'), { status: 413 }));
+    }
+    const chunks = [];
+    let size = 0, aborted = false;
+    req.on('data', (chunk) => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > IMG_MAX_BYTES + 1024 * 1024) {
+        aborted = true;
+        reject(Object.assign(new Error('图片大小不能超过 10MB'), { status: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('error', () => { if (!aborted) { aborted = true; reject(Object.assign(new Error('上传中断，请重试'), { status: 400 })); } });
+    req.on('end', () => {
+      if (aborted) return;
+      const body = Buffer.concat(chunks);
+      /* 结构：--boundary CRLF headers CRLFCRLF bytes CRLF --boundary ... */
+      let pos = body.indexOf(boundary);
+      while (pos >= 0) {
+        const headStart = pos + boundary.length;
+        if (body[headStart] === 0x2D && body[headStart + 1] === 0x2D) break; // --boundary-- 结束
+        const headEnd = body.indexOf('\r\n\r\n', headStart);
+        if (headEnd < 0) break;
+        const head = body.toString('latin1', headStart, headEnd);
+        const dataStart = headEnd + 4;
+        const next = body.indexOf(boundary, dataStart);
+        if (next < 0) break;
+        const dataEnd = next - 2; // 部件末尾的 CRLF
+        if (/name="[^"]*";\s*filename="/.test(head) || /filename="/.test(head)) {
+          const fnM = head.match(/filename="([^"]*)"/);
+          const ctM = head.match(/content-type:\s*([^\r\n]+)/i);
+          return resolve({
+            filename: fnM ? fnM[1] : 'image',
+            contentType: ctM ? ctM[1].trim() : '',
+            buffer: body.subarray(dataStart, Math.max(dataStart, dataEnd)),
+          });
+        }
+        pos = next;
+      }
+      reject(Object.assign(new Error('没有收到图片文件'), { status: 400 }));
+    });
+  });
+}
+
+async function tgBotFetch(token, method, init) {
+  const r = await fetch(`${IMG_TG_BOT_API}/bot${token}/${method}`, init);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || !data.ok) throw new Error(data.description || ('TG HTTP ' + r.status));
+  return data.result;
+}
+
+app.post('/api/upload/image', requireAuth, rlUpload, async (req, res) => {
+  try {
+    const token = process.env.TG_BOT_TOKEN || '';
+    const storeChat = String(process.env.IMAGE_TG_CHAT_ID || '').trim();
+    if (!token || !storeChat) return res.status(503).json({ error: '图片上传尚未配置（缺少存储会话），请先粘贴图片外链' });
+    const file = await readMultipartFile(req);
+    if (!file.buffer.length) return res.status(400).json({ error: '图片文件为空' });
+    if (file.buffer.length > IMG_MAX_BYTES) return res.status(413).json({ error: '图片大小不能超过 10MB' });
+    const kind = sniffImageType(file.buffer);
+    if (!kind) return res.status(400).json({ error: '仅支持 JPG / PNG / GIF / WebP 图片' });
+    const fd = new FormData();
+    fd.append('chat_id', storeChat);
+    fd.append('document', new Blob([file.buffer], { type: kind.mime }), 'forum-' + Date.now() + '.' + kind.ext);
+    const sent = await tgBotFetch(token, 'sendDocument', { method: 'POST', body: fd });
+    const doc = (sent && sent.document) || {};
+    if (!doc.file_id) return res.status(502).json({ error: '图片服务没有返回文件凭证，请重试' });
+    const origin = (req.headers['x-forwarded-proto'] ? String(req.headers['x-forwarded-proto']).split(',')[0].trim() : req.protocol) + '://' + req.get('host');
+    res.status(201).json({ ok: true, url: `${origin}/api/img/${encodeURIComponent(doc.file_id)}`, size: file.buffer.length, mime: kind.mime });
+  } catch (e) {
+    if (e && e.status) return res.status(e.status).json({ error: e.message });
+    res.status(502).json({ error: '图片上传失败，请稍后重试' });
+  }
+});
+
+/* 读图代理：把 file_id 换成 TG 临时直链再取回字节流，本站地址稳定可直接进帖子。
+   file_id 本身即高熵凭证，与现行帖子直引 TG CDN 外链同一口径，不再额外鉴权。 */
+app.get('/api/img/:fileId', async (req, res) => {
+  try {
+    const token = process.env.TG_BOT_TOKEN || '';
+    if (!token) return res.status(503).json({ error: '图片服务未配置' });
+    const fileId = String(req.params.fileId || '');
+    if (!/^[A-Za-z0-9_-]{10,}$/.test(fileId)) return res.status(400).json({ error: '文件凭证无效' });
+    const meta = await tgBotFetch(token, 'getFile?file_id=' + encodeURIComponent(fileId));
+    if (!meta || !meta.file_path) return res.status(404).json({ error: '图片不存在' });
+    const fr = await fetch(`${IMG_TG_BOT_API}/file/bot${token}/${meta.file_path}`);
+    if (!fr.ok) return res.status(502).json({ error: '图片读取失败' });
+    const buf = Buffer.from(await fr.arrayBuffer());
+    const ext = String(meta.file_path).split('.').pop().toLowerCase();
+    const mime = ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' })[ext] || (sniffImageType(buf) || {}).mime || 'application/octet-stream';
+    res.set('Content-Type', mime);
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.send(buf);
+  } catch (e) {
+    res.status(502).json({ error: '图片读取失败' });
+  }
 });
 
 app.post('/api/topics', requireAuth, rlTopic, (req, res) => {

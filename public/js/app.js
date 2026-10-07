@@ -1084,6 +1084,7 @@
           <button type="button" data-ins="- ">列表</button>
           <button type="button" data-ins="[$](https://)" data-sel="链接">链接</button>
           <button type="button" data-ins="@">@提及</button>
+          <button type="button" data-imgup title="上传图片（JPG/PNG/GIF/WebP，≤10MB）">🖼 图片</button>
         </div>
         <textarea class="editor" id="replyBody" placeholder="友善交流，理性发言... 支持 **加粗** 和 @用户名 提醒"></textarea>
         <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
@@ -1366,6 +1367,56 @@
         ta.focus();
       });
     });
+    /* 一键传图：工具栏图片按钮 → 选文件 → 上传 → ![](url) 插入光标处 */
+    const imgBtn = wrap.querySelector('button[data-imgup]');
+    if (imgBtn && !imgBtn.dataset.bound) {
+      imgBtn.dataset.bound = '1';
+      imgBtn.addEventListener('click', () => {
+        const ta = document.getElementById(taId);
+        if (!ta || imgBtn.disabled) return;
+        let picker = document.getElementById('mdImgPicker');
+        if (!picker) {
+          picker = document.createElement('input');
+          picker.type = 'file';
+          picker.id = 'mdImgPicker';
+          picker.accept = 'image/jpeg,image/png,image/gif,image/webp';
+          picker.style.display = 'none';
+          document.body.appendChild(picker);
+        }
+        picker.onchange = async () => {
+          const file = picker.files && picker.files[0];
+          picker.value = '';
+          if (!file) return;
+          if (!/^image\/(jpeg|png|gif|webp)$/.test(file.type)) { toast('仅支持 JPG / PNG / GIF / WebP 图片', 'err'); return; }
+          if (file.size > 10 * 1024 * 1024) { toast('图片大小不能超过 10MB', 'err'); return; }
+          const oldText = imgBtn.textContent;
+          imgBtn.disabled = true;
+          imgBtn.textContent = '⏳ 上传中…';
+          try {
+            const fd = new FormData();
+            fd.append('file', file);
+            const data = await api('/api/upload/image', { method: 'POST', body: fd });
+            const url = data && data.url;
+            if (!url) throw new Error('上传失败，请重试');
+            const sel = ta.selectionStart, end = ta.selectionEnd;
+            const before = ta.value.slice(0, sel), after = ta.value.slice(end);
+            const ins = (before && !before.endsWith('\n') ? '\n' : '') + '![](' + url + ')' + (after && !after.startsWith('\n') ? '\n' : '');
+            ta.value = before + ins + after;
+            const pos = (before + ins).length;
+            ta.focus();
+            try { ta.setSelectionRange(pos, pos); } catch (e) {}
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            toast('图片已插入');
+          } catch (e) {
+            toast(e.message || '图片上传失败', 'err', 3200);
+          } finally {
+            imgBtn.disabled = false;
+            imgBtn.textContent = oldText;
+          }
+        };
+        picker.click();
+      });
+    }
   }
 
   async function renderCompose() {
@@ -1406,6 +1457,7 @@
               <button type="button" data-ins="[$](https://)" data-sel="链接">链接</button>
               <button type="button" data-ins="~~$~~" data-sel="删除线">删除线</button>
               <button type="button" data-ins="@">@提及</button>
+              <button type="button" data-imgup title="上传图片（JPG/PNG/GIF/WebP，≤10MB）">🖼 图片</button>
             </div>
             <textarea class="form-control editor" id="cContent" rows="10" placeholder="写下你的内容..." required>${t ? esc(t.posts[0].content) : ''}</textarea>
           </div>
