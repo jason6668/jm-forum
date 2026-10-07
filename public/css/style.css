@@ -892,6 +892,22 @@ html[data-theme="dark"] .toast { box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
 .ach-desc { font-size: 12px; margin-top: 2px; }
 .ach-check { margin-left: auto; color: var(--green); font-size: 18px; flex-shrink: 0; }
 
+/* —— 首页公告横幅 —— */
+.announce-banner { display: flex; align-items: center; gap: 10px; padding: 10px 14px; margin-bottom: 14px; border-radius: var(--radius-sm); background: linear-gradient(90deg, rgba(255,152,0,0.16), rgba(255,87,34,0.10)); border: 1px solid rgba(255,152,0,0.45); cursor: pointer; }
+.announce-banner:hover { border-color: rgba(255,152,0,0.85); }
+.announce-ic { font-size: 18px; flex: none; }
+.announce-txt { flex: 1; min-width: 0; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.announce-txt strong { margin-right: 8px; }
+.announce-sum { color: var(--muted); font-size: 13px; }
+.announce-more { flex: none; font-size: 12px; color: var(--muted); }
+.announce-close { flex: none; background: none; border: none; font-size: 20px; line-height: 1; cursor: pointer; color: var(--muted); padding: 2px 4px; }
+.announce-close:hover { color: var(--text); }
+.announce-item { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.announce-item:last-child { border-bottom: none; }
+.announce-item-t { font-weight: 700; font-size: 15px; }
+.announce-item-meta { font-size: 12px; color: var(--muted); margin: 4px 0 8px; }
+.announce-item-body { font-size: 14px; line-height: 1.7; word-break: break-word; }
+
 /* —— 弹窗 modal —— */
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 20px; animation: fadeIn .15s; }
 .modal-box { background: var(--bg-card); border-radius: 14px; max-height: 85vh; overflow-y: auto; box-shadow: 0 8px 40px rgba(0,0,0,0.2); width: 100%; }

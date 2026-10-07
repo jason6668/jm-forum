@@ -335,6 +335,12 @@ function scanMentions(db, content, excludeId) {
 }
 function addNotification(db, userId, type, payload) {
   db.notifications = db.notifications || [];
+  /* 屏蔽生效：来自被接收方屏蔽的人的新通知不再生成（单向，只影响接收方） */
+  if (payload && payload.fromId) {
+    const recipient = db.users.find(u => u.id === userId);
+    const bIds = blockedUserIds(db, recipient);
+    if (bIds && bIds.has(payload.fromId)) return;
+  }
   db.notifications.push({ id: id('nt'), userId, type, ...payload, read: false, createdAt: nowIso() });
 }
 function hashPw(p) { return bcrypt.hashSync(p, 10); }
@@ -598,6 +604,22 @@ function userPublic(u) {
 
 /* ================= helpers ================= */
 function boardById(db, id) { return db.boards.find(b => b.id === id); }
+/* 屏蔽名单解析：user.blocked 存的是用户名，这里换成用户 id 集合供过滤用；
+   没有屏蔽名单（或名单里的人都已不存在）时返回 null，调用方据此跳过过滤省开销。
+   屏蔽是单向的：只影响名单持有者自己的所见与收件，对方无感知。 */
+function blockedUserIds(db, user) {
+  if (!user || !Array.isArray(user.blocked) || !user.blocked.length) return null;
+  const names = new Set(user.blocked.map(x => String(x)));
+  const ids = new Set();
+  for (const u of db.users) if (names.has(u.username)) ids.add(u.id);
+  return ids.size ? ids : null;
+}
+/* 过滤被屏蔽者的回帖；首帖（楼主正文，数组第 1 条）始终保留，
+   否则直接打开帖子时正文与摘录会被掏空。计数由调用方按过滤后条数重算。 */
+function filterBlockedPosts(posts, blockedIds) {
+  if (!blockedIds || !Array.isArray(posts)) return posts;
+  return posts.filter((p, i) => i === 0 || !blockedIds.has(p.userId));
+}
 function boardBySlug(db, slug) { return db.boards.find(b => b.slug === slug); }
 
 /* TG 评论者专属头像：按「身份种子」哈希定色 + 显示名首字，同人跨帖稳定。
@@ -979,6 +1001,9 @@ app.get('/api/topics', (req, res) => {
   let topics = db.topics.slice();
   /* 待审核/已拒绝的帖子只对作者本人和管理员可见 */
   topics = topics.filter(t => !t.status || t.status === 'published' || (req.user && (t.userId === req.user.id || STAFF_ROLES.includes(req.user.role))));
+  /* 屏蔽生效：被我屏蔽的人发的帖不进列表；过滤在分页/计数之前，total 与页码口径一致 */
+  const blockedIds = blockedUserIds(db, req.user);
+  if (blockedIds) topics = topics.filter(t => !blockedIds.has(t.userId));
   const { board, sort, tag, mine, following } = req.query;
   if (following) {
     if (!req.user) topics = [];
@@ -998,7 +1023,15 @@ app.get('/api/topics', (req, res) => {
   const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 30));
   const total = topics.length;
   const rows = topics.slice((page - 1) * pageSize, page * pageSize);
-  res.json({ list: rows.map(t => enrichTopic(t, db, { userId: req.user && req.user.id })), total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) });
+  res.json({
+    list: rows.map(t => {
+      if (!blockedIds) return enrichTopic(t, db, { userId: req.user && req.user.id });
+      /* 屏蔽生效：回帖同步过滤，「最后回复」与回复数都按我能看到的口径算，不露被屏蔽者 */
+      const posts = filterBlockedPosts(t.posts || [], blockedIds);
+      return enrichTopic({ ...t, posts, replyCount: Math.max(0, posts.length - 1) }, db, { userId: req.user && req.user.id });
+    }),
+    total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)),
+  });
 });
 
 app.get('/api/topics/recommended', (req, res) => {
@@ -1026,12 +1059,16 @@ app.get('/api/topics/:id', (req, res) => {
   topic.viewCount += 1;
   bumpViewPulse(db);
   /* 评论分页（2026-10-06 秒开）：详情只回首屏 40 楼+总数，翻页走 ?postsPage；旧前端不传参仍拿全量（兼容期不翻页的路径，分页上线后前端不再用） */
-  const allPosts = topic.posts || [];
+  /* 屏蔽生效：被我屏蔽者的回帖不出现在详情里（首帖保留）；
+     postsTotal/回复数随后都按过滤后的 allPosts 计算，与列表口径一致 */
+  const blockedIdsDetail = blockedUserIds(db, req.user);
+  const allPosts = filterBlockedPosts(topic.posts || [], blockedIdsDetail);
   const wantsAll = req.query.postsAll === '1' || req.query.postsPage === undefined;
   const pPage = Math.max(1, parseInt(req.query.postsPage) || 1);
   const pSize = Math.min(100, Math.max(1, parseInt(req.query.postsPageSize) || 40));
   const view = wantsAll ? allPosts : allPosts.slice(0, pPage * pSize);
-  const enriched = enrichTopic(topic, db, { withPosts: true, userId: req.user && req.user.id }, view);
+  const topicView = blockedIdsDetail ? { ...topic, posts: allPosts, replyCount: Math.max(0, allPosts.length - 1) } : topic;
+  const enriched = enrichTopic(topicView, db, { withPosts: true, userId: req.user && req.user.id }, view);
   if (!wantsAll) {
     enriched.postsTotal = allPosts.length;
     enriched.postsShown = view.length;
@@ -2215,6 +2252,13 @@ app.post('/api/messages', requireAuth, (req, res) => {
   if (!peer) return res.status(404).json({ error: '用户不存在' });
   if (peer.id === GHOST.id) return res.status(400).json({ error: '该用户已注销' });
   if (peer.id === req.user.id) return res.status(400).json({ error: '不能给自己发私信' });
+  /* 屏蔽生效（单向，双方都给明确提示，不静默吞消息） */
+  if ((req.user.blocked || []).includes(peer.username)) {
+    return res.status(403).json({ error: `你已屏蔽 ${peer.name || peer.username}，请先在「设置 → 屏蔽用户」中解除屏蔽后再发送私信` });
+  }
+  if ((peer.blocked || []).includes(req.user.username)) {
+    return res.status(403).json({ error: '对方已将你屏蔽，私信无法送达' });
+  }
   const msg = { id: id('ms'), fromId: req.user.id, toId: peer.id, content: text, read: false, createdAt: nowIso() };
   db.messages.push(msg);
   addNotification(db, peer.id, 'message', { fromId: req.user.id, fromName: req.user.name || req.user.username, content: text.slice(0, 80) });
@@ -2237,7 +2281,9 @@ app.get('/api/notifications', requireAuth, (req, res) => {
     }
   }
   if (remChanged) saveDb(db);
-  const list = db.notifications.filter(n => n.userId === req.user.id).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50);
+  /* 屏蔽生效：拉取端再过滤一层，屏蔽前已生成的旧通知也不再展示（生成端已同步拦截新通知） */
+  const blockedIdsNt = blockedUserIds(db, req.user);
+  const list = db.notifications.filter(n => n.userId === req.user.id && !(blockedIdsNt && n.fromId && blockedIdsNt.has(n.fromId))).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50);
   res.json(list.map(n => {
     const from = db.users.find(u => u.id === n.fromId);
     const topic = db.topics.find(t => t.id === n.topicId);
@@ -2246,7 +2292,8 @@ app.get('/api/notifications', requireAuth, (req, res) => {
 });
 app.get('/api/notifications/unread-count', requireAuth, (req, res) => {
   const db = loadDb();
-  res.json({ count: db.notifications.filter(n => n.userId === req.user.id && !n.read).length });
+  const blockedIdsNt = blockedUserIds(db, req.user);
+  res.json({ count: db.notifications.filter(n => n.userId === req.user.id && !n.read && !(blockedIdsNt && n.fromId && blockedIdsNt.has(n.fromId))).length });
 });
 app.post('/api/notifications/read', requireAuth, (req, res) => {
   const db = loadDb();

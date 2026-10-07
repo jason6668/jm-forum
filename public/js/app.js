@@ -473,6 +473,69 @@
   }
 
   /* ---------- pages ---------- */
+  /* ---------- 首页公告横幅（后端 /api/announcements 已有，前端在此消费） ----------
+     展示最新一条未关闭的公告：标题+摘要，点击打开公告列表浮层；
+     关闭按公告 id 记 localStorage，该条不再弹，新公告（新 id）照常出现。 */
+  const ANN_DISMISS_KEY = 'forum-ann-dismissed';
+  let annListCache = [];
+  function dismissedAnnIds() {
+    try { const v = JSON.parse(localStorage.getItem(ANN_DISMISS_KEY) || '[]'); return Array.isArray(v) ? v.filter(x => typeof x === 'string') : []; }
+    catch { return []; }
+  }
+  async function announcementBannerHtml() {
+    let anns = [];
+    try { anns = await api('/api/announcements', { silent: true }); } catch { anns = []; }
+    annListCache = Array.isArray(anns) ? anns.filter(a => a && a.id) : [];
+    if (!annListCache.length) return '';
+    const dismissed = new Set(dismissedAnnIds());
+    const visible = annListCache.filter(a => !dismissed.has(String(a.id)));
+    if (!visible.length) return '';
+    const top = visible[0];
+    const summary = String(top.content || '').replace(/\s+/g, ' ').trim();
+    return `
+      <div class="announce-banner" id="announceBanner" data-ann-id="${esc(top.id)}" role="button" tabindex="0" title="点击查看公告">
+        <span class="announce-ic">📢</span>
+        <span class="announce-txt"><strong>${esc(top.title)}</strong>${summary ? `<span class="announce-sum">${esc(summary.slice(0, 90))}</span>` : ''}</span>
+        <span class="announce-more">${visible.length > 1 ? `共 ${visible.length} 条 ›` : '详情 ›'}</span>
+        <button type="button" class="announce-close" id="announceClose" aria-label="关闭这条公告">&times;</button>
+      </div>`;
+  }
+  function bindAnnouncementBanner() {
+    const banner = document.getElementById('announceBanner');
+    if (!banner) return;
+    const openList = () => {
+      const modal = document.createElement('div');
+      modal.className = 'modal-overlay';
+      modal.innerHTML = `
+        <div class="modal-box" style="max-width:560px">
+          <div class="modal-head"><h3>📢 全站公告</h3><button class="modal-close">&times;</button></div>
+          <div class="modal-body">
+            ${annListCache.map(a => `
+              <div class="announce-item">
+                <div class="announce-item-t">${esc(a.title)}</div>
+                <div class="announce-item-meta">${esc(fmtDateTime(a.createdAt))}${a.createdBy ? ` · ${esc(a.createdBy)}` : ''}</div>
+                <div class="announce-item-body">${esc(a.content || '').replace(/\n/g, '<br>')}</div>
+              </div>`).join('')}
+          </div>
+        </div>`;
+      document.body.appendChild(modal);
+      modal.querySelector('.modal-close').onclick = () => modal.remove();
+      modal.onclick = e => { if (e.target === modal) modal.remove(); };
+    };
+    banner.addEventListener('click', openList);
+    banner.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openList(); } });
+    const closeBtn = document.getElementById('announceClose');
+    if (closeBtn) closeBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      const annId = banner.dataset.annId;
+      if (annId) {
+        const ids = dismissedAnnIds();
+        if (!ids.includes(annId)) { ids.push(annId); try { localStorage.setItem(ANN_DISMISS_KEY, JSON.stringify(ids.slice(-50))); } catch { /* 隐私模式写不进则仅本次关闭 */ } }
+      }
+      banner.remove();
+    });
+  }
+
   async function renderHome(boardSlug, sort, page = 1, feed = '') {
     const qs = new URLSearchParams();
     if (feed === 'following') qs.set('following', '1');
@@ -482,6 +545,7 @@
     const topics = data.list || [];
     const pages = data.pages || 1;
     const cur = Math.min(page, pages);
+    const annHtml = await announcementBannerHtml();
     /* 关注流：只看关注的人发的帖子 */
     if (feed === 'following') {
       const buildUrl = (p) => '/?feed=following' + (p > 1 ? `&page=${p}` : '');
@@ -511,12 +575,14 @@
           </div>` : ''}`;
       }
       renderPage(`
+        ${annHtml}
         <div class="card" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
           <div style="font-weight:700">👀 关注动态</div>
           <div class="muted" style="font-size:13px">只看你关注的人发的帖子</div>
         </div>
         ${topics.length ? postListHtml(topics) + (pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : '') : recHtml}
       `);
+      bindAnnouncementBanner();
       document.querySelectorAll('.follow-btn').forEach(b => b.addEventListener('click', async () => {
         if (!state.user) return route('/login?next=' + encodeURIComponent('/?feed=following'));
         try {
@@ -543,6 +609,7 @@
       return '/' + (s ? '?' + s : '');
     };
     renderPage(`
+      ${annHtml}
       ${boardTabsHtml(boardSlug)}
       ${boardSlug === 'unemployment' ? `
         <a href="/companies" class="card comp-banner">
@@ -564,6 +631,7 @@
       ${pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : ''}
     `);
     bindSortTabs(boardSlug, sort || 'latest');
+    bindAnnouncementBanner();
     setNav('home');
   }
 
@@ -2362,12 +2430,13 @@
   /* ---------- settings page ---------- */
   async function renderSettings(section) {
     if (!state.user) { route('/login?next=/settings'); return; }
+    /* 未知分区（含已下线的旧链接）一律回落到个人资料，避免空白页 */
+    if (!['profile', 'security', 'contacts', 'blocked', 'preferences', 'homeboard', 'extensions'].includes(section)) section = 'profile';
     const data = await api('/api/settings');
     const user = data.user;
     const boards = data.boards;
     const menuItems = [
       { id: 'profile', icon: '👤', label: '个人资料' },
-      { id: '2fa', icon: '🔐', label: '双因素验证' },
       { id: 'security', icon: '🔑', label: '账号安全' },
       { id: 'contacts', icon: '📇', label: '联系方式' },
       { id: 'blocked', icon: '🚫', label: '屏蔽用户' },
@@ -2421,17 +2490,6 @@
           <div class="settings-footer"><span class="settings-msg" id="sMsg"></span><button class="btn btn-primary" id="saveProfile">保存资料</button></div>
         </div>`,
 
-      '2fa': `
-        <div class="settings-section ${section === '2fa' ? 'active' : ''}" data-section="2fa">
-          <h2>双因素验证</h2>
-          <div style="padding:20px;background:var(--bg-card-2);border:1px solid var(--border);border-radius:var(--radius-sm);text-align:center">
-            <div style="font-size:36px;margin-bottom:10px">🔒</div>
-            <p style="margin:0 0 14px">当前状态：<span class="muted">未开启</span></p>
-            <p class="muted" style="font-size:13px">开启 2FA 后，登录时除了密码还需要输入动态验证码，显著提升账号安全性。</p>
-            <button class="btn btn-primary" style="margin-top:14px" id="enable2fa">启用双因素验证</button>
-          </div>
-        </div>`,
-
       security: `
         <div class="settings-section ${section === 'security' ? 'active' : ''}" data-section="security">
           <h2>账号安全</h2>
@@ -2456,7 +2514,7 @@
       blocked: `
         <div class="settings-section ${section === 'blocked' ? 'active' : ''}" data-section="blocked">
           <h2>屏蔽用户</h2>
-          <p class="muted">被屏蔽的用户无法给你发送私信，你也不会看到他们的帖子（后续版本生效）。</p>
+          <p class="muted">屏蔽后：对方的帖子和回复不会出现在你的列表里，对方给你发私信会被拦截，你也不会再收到来自对方的通知。屏蔽只对你自己生效，对方不会收到任何提示。</p>
           <div class="form-group" style="display:flex;gap:8px">
             <input type="text" class="form-control" id="blockInput" placeholder="输入要屏蔽的用户名">
             <button class="btn btn-danger" id="addBlock">屏蔽</button>
@@ -2588,10 +2646,6 @@
         signature: document.getElementById('sSignature').value,
         readme: document.getElementById('sReadme').value,
       }));
-    }
-
-    if (section === '2fa') {
-      document.getElementById('enable2fa').addEventListener('click', () => alert('双因素验证功能开发中，将在后续版本上线。'));
     }
 
     if (section === 'contacts') {
