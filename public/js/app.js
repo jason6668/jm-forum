@@ -271,7 +271,7 @@
     const closed = t.closed ? '<span class="badge badge-closed">只读</span>' : '';
     const tags = (t.tags || []).map(x => `<a class="tag-chip tag-link" href="/tag/${encodeURIComponent(x)}">${esc(x)}</a>`).join('');
     const last = t.lastReply ? `
-      <span class="sep">·</span> 最后回复 <a href="/space/${esc(t.lastReply.username)}">${esc(t.lastReply.name)}</a>
+      <span class="sep">·</span> 最后回复 <a href="/space/${esc(t.lastReply.username)}">${esc(t.lastReply.name)}${t.lastReply.authorTag ? `<em class="tg-tag">${esc(t.lastReply.authorTag)}</em>` : ''}</a>
       <span class="sep">·</span> ${fmtTime(t.lastReply.at)}
     ` : '';
     return `
@@ -966,7 +966,7 @@
   async function renderPost(slug) {
     let topic;
     try {
-      [topic] = await Promise.all([api('/api/topics/' + encodeURIComponent(slug)), loadBoards()]);
+      [topic] = await Promise.all([api('/api/topics/' + encodeURIComponent(slug) + '?postsPage=1&postsPageSize=40'), loadBoards()]);
     } catch (e) {
       /* 阅读等级不足 */
       if (e.needLevel) {
@@ -1038,12 +1038,12 @@
         <p class="muted" style="font-size:13px;margin:0">楼主尚未采纳答案，悬赏悬而未决。帮楼主解决问题，有机会获得全部悬赏！</p>
       </div>`) : '';
 
-    const postsHtml = (topic.posts || []).map((p, idx) => `
+    const postItemHtml = (p, idx) => `
       <div class="post-item ${topic.bestReplyId === p.id ? 'best-reply' : ''}">
         <div class="post-avatar"><a href="/space/${esc(p.author.username)}"><img src="${esc(avatar(p.author))}" alt=""></a></div>
         <div class="post-main">
           <div class="post-head">
-            <a class="post-username" href="/space/${esc(p.author.username)}">${esc(p.author.name)}</a>${roleTag(p.author)}${levelTag(p.author)}${titleTag(p.author)}
+            <a class="post-username" href="/space/${esc(p.author.username)}">${esc(p.author.name)}${p.author && p.author.authorTag ? `<em class="tg-tag">${esc(p.author.authorTag)}</em>` : ''}</a>${roleTag(p.author)}${levelTag(p.author)}${titleTag(p.author)}
             <span class="post-floor">${p.postNumber} 楼</span>
             <span class="post-time">${fmtTime(p.createdAt)}</span>
             ${topic.bestReplyId === p.id ? '<span class="best-tag">🏆 最佳答案</span>' : ''}
@@ -1069,7 +1069,8 @@
             return `<button class="react-btn ${st.mine ? 'on' : ''}" data-emoji="${e}" title="回应">${e}<span>${st.count || ''}</span></button>`;
           }).join('')}</div>` : ''}
         </div>
-      </div>`).join('');
+      </div>`;
+    const postsHtml = (topic.posts || []).map((p, idx) => postItemHtml(p, idx)).join('');
 
     const replyBox = state.user ? `
       <div class="reply-box">
@@ -1094,7 +1095,7 @@
         <p>参与讨论请先 <a href="/login?next=${encodeURIComponent(location.pathname + location.search)}">登录</a> 或 <a href="/register">注册</a></p>
       </div>`;
 
-    renderPage(`${head}${pollHtml}${bountyHtml}<div class="post-stream">${postsHtml}</div>${replyBox}`);
+    renderPage(`${head}${pollHtml}${bountyHtml}<div class="post-stream">${postsHtml}</div><div id="postMoreBox">${topic.postsHasMore ? '<button class="btn btn-ghost" id="postMoreBtn" style="display:block;margin:16px auto">加载更多评论（已看 ' + (topic.postsShown || (topic.posts || []).length) + ' / 共 ' + topic.postsTotal + ' 楼）</button>' : ''}</div>${replyBox}`);
 
     // toolbar insert
     bindMdToolbar('replyBody');
@@ -1112,8 +1113,11 @@
     /* 移动端底部评论条（虎扑 App 式） */
     setupMobileCommentBar(topic);
 
-    // like（乐观更新：先改 UI，失败回滚）
-    document.querySelectorAll('.like-btn').forEach(btn => {
+    /* 评论区按钮全集（点赞/回应/打赏/采纳/引用/删除/举报/收藏/提醒）：作用域化，
+       追加评论后对新加的帖子节点再跑一遍，否则新拉下来的评论点了没反应（用户 2026-10-05 铁律：每个按钮点了马上反应） */
+    function bindPostButtons(scopeEl) {
+      // like（乐观更新：先改 UI，失败回滚）
+      scopeEl.querySelectorAll('.like-btn').forEach(btn => {
       btn.addEventListener('click', async () => {
         if (!state.user) { toast('请先登录', 'err'); route('/login?next=' + encodeURIComponent(location.pathname + location.search)); return; }
         const wasLiked = btn.dataset.liked === '1';
@@ -1141,7 +1145,7 @@
       });
     });
     // 表情回应
-    document.querySelectorAll('.react-btn').forEach(btn => {
+    scopeEl.querySelectorAll('.react-btn').forEach(btn => {
       btn.addEventListener('click', async () => {
         if (!state.user) { toast('请先登录', 'err'); route('/login?next=' + encodeURIComponent(location.pathname + location.search)); return; }
         const emoji = btn.dataset.emoji;
@@ -1163,7 +1167,7 @@
       });
     });
     // favorite（乐观更新）
-    const fav = document.getElementById('favBtn');
+    const fav = scopeEl.querySelector('#favBtn');
     if (fav) fav.addEventListener('click', async () => {
       const wasOn = fav.classList.contains('fav-on');
       fav.classList.toggle('fav-on', !wasOn);
@@ -1179,7 +1183,7 @@
       }
     });
     // 书签提醒
-    const rmdBtn = document.getElementById('remindBtn');
+    const rmdBtn = scopeEl.querySelector('#remindBtn');
     if (rmdBtn) rmdBtn.addEventListener('click', async () => {
       const v = prompt('什么时候提醒你回看？输入小时数（1-720），取消则留空后点"取消提醒"：\n如：24 = 1天后', '24');
       try {
@@ -1196,7 +1200,7 @@
       } catch (e) { toast(e.message, 'err'); }
     });
     // copy link（带降级）
-    document.querySelectorAll('.copy-link').forEach(b => {
+    scopeEl.querySelectorAll('.copy-link').forEach(b => {
       b.addEventListener('click', async () => {
         const ok = await copyText(location.href);
         b.textContent = ok ? '✅ 已复制' : '🔗 分享';
@@ -1205,7 +1209,7 @@
       });
     });
     // 投票
-    const pollVoteBtn = document.getElementById('pollVote');
+    const pollVoteBtn = scopeEl === document ? document.getElementById('pollVote') : null;
     if (pollVoteBtn) {
       pollVoteBtn.addEventListener('click', async () => {
         const opts = [...document.querySelectorAll('.poll-opt')];
@@ -1228,7 +1232,7 @@
       });
     }
     // 打赏（楼主或楼层）
-    document.querySelectorAll('.tip-btn').forEach(b => {
+    scopeEl.querySelectorAll('.tip-btn').forEach(b => {
       b.addEventListener('click', async () => {
         const amount = prompt(`打赏给「${b.dataset.author}」多少鸡腿？（1-10000）`);
         if (amount === null) return;
@@ -1244,7 +1248,7 @@
       });
     });
     // 采纳悬赏答案
-    document.querySelectorAll('.accept-btn').forEach(b => {
+    scopeEl.querySelectorAll('.accept-btn').forEach(b => {
       b.addEventListener('click', async () => {
         if (!confirm(`确认采纳「${b.dataset.author}」的答案为最佳答案？悬赏 ${topic.bounty} 鸡腿将发放给他（不可撤销）`)) return;
         try {
@@ -1255,7 +1259,7 @@
       });
     });
     // 引用回复：把楼层内容以 blockquote 形式填入回复框
-    document.querySelectorAll('.quote-btn').forEach(b => {
+    scopeEl.querySelectorAll('.quote-btn').forEach(b => {
       b.addEventListener('click', () => {
         const ta = document.getElementById('replyBody');
         if (!ta) { toast('请先登录后再回复', 'err'); return; }
@@ -1269,7 +1273,7 @@
       });
     });
     // 删除帖子（作者/管理员）
-    document.querySelectorAll('.del-btn').forEach(b => {
+    scopeEl.querySelectorAll('.del-btn').forEach(b => {
       b.addEventListener('click', async () => {
         if (!confirm('⚠️ 确认删除该帖子？此操作不可恢复！')) return;
         try {
@@ -1279,7 +1283,7 @@
       });
     });
     // 举报
-    document.querySelectorAll('.report-btn').forEach(b => {
+    scopeEl.querySelectorAll('.report-btn').forEach(b => {
       b.addEventListener('click', async () => {
         if (!state.user) { route('/login?next=' + encodeURIComponent(location.pathname)); return; }
         const reason = prompt('举报理由（必填，管理员会看到）：');
@@ -1292,7 +1296,58 @@
         } catch (e) { alert(e.message); }
       });
     });
+    }
+
+    bindPostButtons(document);
     setNav('');
+    setupPostPager(topic, postItemHtml);
+  }
+
+  /* 评论分页滚动续拉（2026-10-06 秒开）：详情首屏只拉 40 楼，长帖向下滚时自动往后拉、
+     也可点按钮。追加时用新 div 当容器单独跑 bindPostButtons，避免新评论点了没反应、
+     也防止把老按钮重复绑一遍（用户 2026-10-05 铁律：每个按钮点了马上反应）。 */
+  function setupPostPager(topic, postItemHtml) {
+    const btn = document.getElementById('postMoreBtn');
+    if (!btn || !(topic.postsShown >= 0)) return;
+    const stream = document.querySelector('.post-stream');
+    if (!stream) return;
+    let page = 1;
+    let shown = topic.postsShown || (topic.posts || []).length;
+    const total = topic.postsTotal || shown;
+    let hasMore = shown < total;
+    let loading = false;
+    const label = () => `加载更多评论（已看 ${shown} / 共 ${total} 楼）`;
+    async function loadNext() {
+      if (loading || !hasMore) return;
+      loading = true;
+      const oldText = btn.textContent;
+      btn.textContent = '正在加载更多评论…';
+      try {
+        const next = page + 1;
+        const r = await api('/api/topics/' + encodeURIComponent(topic.id) + `?postsPage=${next}&postsPageSize=40`);
+        const fresh = (r.posts || []).slice(shown);
+        if (fresh.length) {
+          const host = document.createElement('div');
+          host.innerHTML = fresh.map((p, i) => postItemHtml(p, shown + i)).join('');
+          stream.appendChild(host);
+          bindPostButtons(host);
+          shown += fresh.length;
+        }
+        page = next;
+        hasMore = !!r.postsHasMore;
+        if (hasMore) btn.textContent = label(); else { btn.remove(); }
+      } catch (e) {
+        btn.textContent = oldText;
+        toast('加载更多失败，请重试', 'err');
+      } finally { loading = false; }
+    }
+    btn.addEventListener('click', loadNext);
+    if (typeof IntersectionObserver !== 'undefined') {
+      const ob = new IntersectionObserver((entries) => {
+        for (const en of entries) if (en.isIntersecting) loadNext();
+      }, { rootMargin: '800px 0px' });
+      ob.observe(btn);
+    }
   }
 
   /* Markdown 编辑器工具栏：给 textarea 绑定快捷插入 */

@@ -1381,3 +1381,6 @@ button.is-busy::after, .btn.is-busy::after, .like-btn.is-busy::after {
   animation: jmSpin .55s linear infinite;
 }
 @keyframes jmSpin { to { transform: rotate(360deg); } }
+
+/* === 同名分人小角标：导入评论按名字区分的稳定编号，淡化不抢眼 === */
+.tg-tag { font-style: normal; font-size: 11px; color: var(--text-muted, #8a94a6); opacity: .75; margin-left: 2px; font-weight: 400; }

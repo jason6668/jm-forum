@@ -3078,6 +3078,27 @@ function submissionNoteHeader(db, topic) {
   return `> 🌳 来自${srcLabel} · ${who}`;
 }
 
+/* 同步帖子到聊天「树洞」频道（机器人代发；聊天侧按 topicId 去重）；失败只记 topic.chatSyncError，不拦主流程。
+   审核通过与各 TG 导入路径共用这一个出口，保证发往聊天的 payload 完全一致。 */
+async function syncTopicToChatTreehole(db, topic) {
+  let chat = { skipped: true, reason: '聊天同步未配置' };
+  const chatUrl = process.env.CHAT_TREEHOLE_URL || '';
+  const chatSecret = process.env.CHAT_TREEHOLE_SECRET || '';
+  if (chatUrl && chatSecret) {
+    try {
+      const au = db.users.find(u => u.id === topic.userId);
+      const authorName = topic.tgSubmitter || (topic.anonymous ? '' : ((au && (au.name || au.username)) || ''));
+      const r = await fetch(chatUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-sync-secret': chatSecret }, body: JSON.stringify({ topicId: topic.id, authorName, anonymous: !!topic.anonymous, content: ((topic.posts[0] || {}).content || '').slice(0, 4000) }) });
+      chat = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
+      if (!r.ok) topic.chatSyncError = String((chat && chat.error) || r.status).slice(0, 200);
+    } catch (e) {
+      chat = { error: String(e.message || e).slice(0, 200) };
+      topic.chatSyncError = chat.error;
+    }
+  }
+  return chat;
+}
+
 /* 审核通过的统一动作：公开帖子 + 发电报频道 + 同步聊天树洞频道。总控网页与 TG 机器人按钮共用。 */
 async function doApproveTopic(db, topic) {
   /* 投稿备注（导入帖已有「转自」落款的不重复加） */
@@ -3096,22 +3117,8 @@ async function doApproveTopic(db, topic) {
     tg = { error: String(e.message || e).slice(0, 200) };
     topic.tgPublishError = tg.error;
   }
-  /* 同步到聊天「树洞」频道，机器人代发；失败只记录不拦审核 */
-  let chat = { skipped: true, reason: '聊天同步未配置' };
-  const chatUrl = process.env.CHAT_TREEHOLE_URL || '';
-  const chatSecret = process.env.CHAT_TREEHOLE_SECRET || '';
-  if (chatUrl && chatSecret) {
-    try {
-      const au = db.users.find(u => u.id === topic.userId);
-      const authorName = topic.tgSubmitter || (topic.anonymous ? '' : ((au && (au.name || au.username)) || ''));
-      const r = await fetch(chatUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-sync-secret': chatSecret }, body: JSON.stringify({ topicId: topic.id, authorName, anonymous: !!topic.anonymous, content: ((topic.posts[0] || {}).content || '').slice(0, 4000) }) });
-      chat = await r.json().catch(() => ({ error: 'HTTP ' + r.status }));
-      if (!r.ok) topic.chatSyncError = String((chat && chat.error) || r.status).slice(0, 200);
-    } catch (e) {
-      chat = { error: String(e.message || e).slice(0, 200) };
-      topic.chatSyncError = chat.error;
-    }
-  }
+  /* 同步到聊天「树洞」频道（与各导入路径共用同一出口，失败只记录不拦审核） */
+  const chat = await syncTopicToChatTreehole(db, topic);
   return { tg, chat };
 }
 
@@ -3791,7 +3798,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   }
   state.channel = channel;
   let skippedAds = 0;
-  const importOne = (p, srcChannel = channel, opts = {}) => {
+  const importOne = async (p, srcChannel = channel, opts = {}) => {
     if (!p.text && !p.image) return 'empty';
     if (TG_AD_RE.test(p.text)) { skippedAds++; return 'ad'; }
     /* 已搬过的自动跳过（按来源频道+编号判定，不同频道编号相同也不误伤），防重置/补齐时重复发帖 */
@@ -3808,7 +3815,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     /* 标签登记进标签库，侧栏标签云/标签页才有入口（树洞/忏悔室等） */
     if (!Array.isArray(db.tags)) db.tags = [];
     for (const tgName of newTags) if (tgName && !db.tags.some(x => x.name === tgName)) db.tags.push({ id: id('t'), name: tgName });
-    db.topics.push({
+    const importedTopic = {
       id: topicId, title, slug: uniqueSlug(slugify(title), db.topics) + '-' + p.mid, boardId: board.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
       tags: newTags, posts: [{ id: id('p'), topicId, userId: bot.id, content: body, createdAt: time, likeCount: 0, postNumber: 1 }],
@@ -3818,8 +3825,12 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       tgMid: p.mid, tgChannel: srcChannel, tgCommentIds: [], tgCommentMin: 0, tgCommentsDone: false,
       ...(opts.anonymous ? { anonymous: true } : {}),
       ...(opts.source ? { source: opts.source } : {}),
-    });
+    };
+    db.topics.push(importedTopic);
     board.topicCount = (board.topicCount || 0) + 1;
+    /* 导入即正式帖，与审核通过同一出口同步到聊天树洞频道（失败只记 chatSyncError 不拦导入）；
+       历史回填（opts.backfill）只进论坛不刷聊天，只同步守望/增量新帖 */
+    if (!opts.backfill) await syncTopicToChatTreehole(db, importedTopic);
     return 'ok';
   };
   /* ① 最新一页 */
@@ -3836,7 +3847,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   const synced = [];
   if (posts.length && (!state.lastId || !state.oldestId)) {
     /* 首次/补齐：整页过一遍（已搬的靠 slug 去重跳过），不留缝隙 */
-    for (const p of posts) { if (importOne(p) === 'ok') synced.push(p.mid); }
+    for (const p of posts) { if (await importOne(p) === 'ok') synced.push(p.mid); }
     state.lastId = pageMax;
     state.oldestId = posts[0].mid;
   } else {
@@ -3844,7 +3855,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     let lastProcessed = state.lastId;
     for (const p of candidates) {
       lastProcessed = p.mid;
-      if (importOne(p) === 'ok') synced.push(p.mid);
+      if (await importOne(p) === 'ok') synced.push(p.mid);
     }
     state.lastId = lastProcessed && lastProcessed < pageMax ? lastProcessed : pageMax;
   }
@@ -3869,7 +3880,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       if (pageMin >= state.oldestId) break; /* 编号没推进，防死循环 */
       for (const p of older) {
         if (p.mid >= state.oldestId) continue;
-        if (importOne(p) === 'ok') backfilled++;
+        if (await importOne(p, channel, { backfill: true }) === 'ok') backfilled++;
       }
       state.oldestId = pageMin;
       if (pageMin <= 1) state.done = true;
@@ -3894,7 +3905,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       if (pageMin >= state.legacy.oldestId) break;
       for (const p of older) {
         if (p.mid >= state.legacy.oldestId) continue;
-        if (importOne(p, state.legacy.channel) === 'ok') legacyBackfilled++;
+        if (await importOne(p, state.legacy.channel, { backfill: true }) === 'ok') legacyBackfilled++;
       }
       state.legacy.oldestId = pageMin;
       if (pageMin <= 1) state.legacy.done = true;
@@ -3914,12 +3925,12 @@ app.get('/api/cron/tg-sync', async (req, res) => {
         const mposts = parsePosts(await rm.text());
         if (mposts.length) {
           if (!mig.lastId) {
-            for (const p of mposts) { if (importOne(p, migChannel, migOpts) === 'ok') migrated++; }
+            for (const p of mposts) { if (await importOne(p, migChannel, { ...migOpts, backfill: true }) === 'ok') migrated++; }
             mig.lastId = mposts[mposts.length - 1].mid;
             mig.oldestId = mposts[0].mid;
           } else {
             for (const p of mposts.filter(x => x.mid > mig.lastId).slice(0, 10)) {
-              if (importOne(p, migChannel, migOpts) === 'ok') migrated++;
+              if (await importOne(p, migChannel, migOpts) === 'ok') migrated++;
               if (p.mid > mig.lastId) mig.lastId = p.mid;
             }
           }
@@ -3945,7 +3956,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
         if (pageMin >= mig.oldestId) break;
         for (const p of older) {
           if (p.mid >= mig.oldestId) continue;
-          if (importOne(p, migChannel, migOpts) === 'ok') migrated++;
+          if (await importOne(p, migChannel, { ...migOpts, backfill: true }) === 'ok') migrated++;
         }
         mig.oldestId = pageMin;
         if (pageMin <= 1) mig.done = true;
