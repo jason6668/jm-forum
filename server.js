@@ -319,12 +319,29 @@ function migrate(db) {
         const p0 = (t.posts || [])[0];
         if (p0 && typeof p0.content === 'string') {
           p0.content = p0.content
-            .replace(/> 🤖 数据来源：([^\n]*?)（TrendRadar 同款聚合），机器人每日早上 8 点自动抓取整理，仅供吃瓜参考。/, '> 📰 数据来源：$1（TrendRadar 同款聚合），由马老师专属新闻每日早上 8 点自动抓取整理。')
+            .replace(/> 🤖 数据来源：([^\n]*?)（TrendRadar 同款聚合），机器人每日早上 8 点自动抓取整理，仅供吃瓜参考。/, '> 📰 数据来源：$1，由马老师专属新闻每日早上 8 点自动抓取整理。')
             .replace('🍉 今日份的瓜已送达，欢迎在评论区补充你看到的大瓜～', '📰 今日份新闻已送达，欢迎在评论区补充你看到的热点～');
         }
       }
     }
     db.newsRebrandV1 = { at: nowIso(), renamed, moved };
+  }
+  /* 来源行口径（一次性，2026-10-07 用户定）：删去来源行里的「（TrendRadar 同款聚合）」字样，只动 newsbot 的帖。 */
+  if (!db.newsSourceLineV2) {
+    const bot = db.users.find(u => u.username === 'newsbot');
+    let cleaned = 0;
+    if (bot) {
+      for (const t of db.topics) {
+        if (t.userId !== bot.id) continue;
+        for (const p of (t.posts || [])) {
+          if (p && typeof p.content === 'string' && p.content.includes('（TrendRadar 同款聚合）')) {
+            p.content = p.content.replace(/（TrendRadar 同款聚合）/g, '');
+            cleaned++;
+          }
+        }
+      }
+    }
+    db.newsSourceLineV2 = { at: nowIso(), cleaned };
   }
   /* v8 升级：等级体系 / 积分商城 / 打赏悬赏 / 投票 / 成就 / 鸡腿交易 */
   if (!Array.isArray(db.shopItems) || !db.shopItems.length) db.shopItems = seedShop();
@@ -3358,7 +3375,7 @@ app.get('/api/cron/daily-news', async (req, res) => {
     return `\n## ${s.emoji} ${s.name}\n\n${lines.join('\n')}\n`;
   };
   const srcNames = results.filter(s => s.items.length).map(s => s.name).join(' · ');
-  const content = `> 📰 数据来源：${srcNames}（TrendRadar 同款聚合），由马老师专属新闻每日早上 8 点自动抓取整理。\n`
+  const content = `> 📰 数据来源：${srcNames}，由马老师专属新闻每日早上 8 点自动抓取整理。\n`
     + results.map(sec).join('')
     + `\n---\n📰 今日份新闻已送达，欢迎在评论区补充你看到的热点～`;
   const time = nowIso();
