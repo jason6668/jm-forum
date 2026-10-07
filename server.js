@@ -739,6 +739,13 @@ app.post('/api/auth/register', rlAuth, async (req, res) => {
     const { username, email, password, name, code } = req.body || {};
     if (!username || !email || !password) return res.status(400).json({ error: '缺少必填字段' });
     const db = loadDb();
+    /* 人机验证：免码窗开启或同 IP 1 小时内无码尝试 ≥3 次时强制；带邀请码豁免。
+       校验放在消耗邀请码之前，验证码不过不烧码；响应 needCaptcha 让前端动态显示验证码 */
+    const hasInviteCode = !!String(code || '').trim();
+    if (regNeedCaptcha(db, req, hasInviteCode) && !checkCaptcha(req.body.captchaId, req.body.captchaAnswer)) {
+      return res.status(400).json({ error: req.body.captchaId ? '验证码不正确或已过期，请刷新后重试' : '请填写图形验证码', needCaptcha: true });
+    }
+    noteRegAttempt(req);
     if (db.users.find(u => u.username === username || u.email === email)) return res.status(409).json({ error: '用户名或邮箱已存在' });
     // 邀请注册制：必须持有管理员发放的注册码；开放注册窗口期内免码（总控「注册码中心」开启）
     const regOpen = !!((db.settings || {}).regOpenUntil && Date.now() < new Date(db.settings.regOpenUntil).getTime());
@@ -803,7 +810,6 @@ async function applyRegWindow(body) {
   await flushNow();
   return regWindowState(db);
 }
-app.get('/api/auth/reg-status', (req, res) => { res.json(regWindowState(loadDb())); });
 app.get('/api/admin/reg-window', requireAdmin, (req, res) => { res.json(regWindowState(loadDb())); });
 app.post('/api/admin/reg-window', requireAdmin, async (req, res) => {
   try { res.json(await applyRegWindow(req.body || {})); }
@@ -873,6 +879,218 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 app.get('/api/auth/me', (req, res) => res.json({ user: userPublic(req.user) }));
+
+/* ================= 账号安全：邮箱找回密码 + 注册图形验证码 ================= */
+/* 邮件发送层（适配式）：仓库原本没有任何邮件通道，这里基于 Node 内置 net/tls 自研
+   极简 SMTP 客户端，零新依赖。环境变量：SMTP_HOST / SMTP_PORT(默认465) /
+   SMTP_SECURE(true=隐式TLS 465，false=明文，可自动 STARTTLS) / SMTP_USER / SMTP_PASS / SMTP_FROM。
+   未配置 SMTP_HOST+SMTP_FROM 时视为「邮件通道未开通」：忘记密码接口仍会生成并落库
+   重置令牌、把重置链接打进服务端日志（管理员从日志取链接人工转交），但绝不假装已发信。 */
+function mailConfigured() {
+  return !!(process.env.SMTP_HOST && process.env.SMTP_FROM);
+}
+function sha256hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
+
+/* 极简 SMTP 会话：读多行回复（250-… 直到 250 …） */
+function smtpCommand(state, line, expect) {
+  return new Promise((resolve, reject) => {
+    state.waiter = { resolve, reject, expect };
+    if (line != null) state.socket.write(line + '\r\n');
+  });
+}
+async function sendSmtpMail({ to, subject, text }) {
+  const net = require('net');
+  const tls = require('tls');
+  const host = process.env.SMTP_HOST;
+  const port = parseInt(process.env.SMTP_PORT || '465', 10);
+  let secure = String(process.env.SMTP_SECURE || (port === 465 ? 'true' : 'false')).toLowerCase() !== 'false';
+  const user = process.env.SMTP_USER || '';
+  const pass = process.env.SMTP_PASS || '';
+  const from = process.env.SMTP_FROM;
+  const state = { socket: null, buf: '', waiter: null, lines: [] };
+  const feed = (chunk) => {
+    state.buf += chunk;
+    let idx;
+    while (state.waiter && (idx = state.buf.indexOf('\r\n')) >= 0) {
+      const line = state.buf.slice(0, idx);
+      state.buf = state.buf.slice(idx + 2);
+      state.lines.push(line);
+      if (/^\d{3} /.test(line)) {
+        const code = parseInt(line.slice(0, 3), 10);
+        const w = state.waiter; state.waiter = null;
+        const full = state.lines.join('\n'); state.lines = [];
+        if (w.expect && !w.expect.includes(code)) w.reject(new Error('SMTP 期望 ' + w.expect.join('/') + ' 实际 ' + code + '：' + line));
+        else w.resolve({ code, text: full });
+      }
+    }
+  };
+  const connect = () => new Promise((resolve, reject) => {
+    const onErr = (e) => reject(e);
+    if (secure) state.socket = tls.connect({ host, port, servername: host }, () => { state.socket.off('error', onErr); resolve(); });
+    else state.socket = net.connect({ host, port }, () => { state.socket.off('error', onErr); resolve(); });
+    state.socket.once('error', onErr);
+    state.socket.on('data', feed);
+    state.socket.setTimeout(15000, () => { try { state.socket.destroy(new Error('SMTP 超时')); } catch (e) {} });
+  });
+  try {
+    await connect();
+    await smtpCommand(state, null, [220]);                       // 服务器问候
+    let ehlo = await smtpCommand(state, 'EHLO localhost', [250]);
+    if (!secure && /STARTTLS/i.test(ehlo.text) && String(process.env.SMTP_STARTTLS || 'true').toLowerCase() !== 'false') {
+      await smtpCommand(state, 'STARTTLS', [220]);
+      await new Promise((resolve, reject) => {
+        const old = state.socket;
+        state.socket = tls.connect({ socket: old, servername: host }, resolve);
+        state.socket.once('error', reject);
+        state.socket.on('data', feed);
+        state.socket.setTimeout(15000, () => { try { state.socket.destroy(new Error('SMTP 超时')); } catch (e) {} });
+      });
+      secure = true;
+      ehlo = await smtpCommand(state, 'EHLO localhost', [250]);
+    }
+    if (user) {
+      await smtpCommand(state, 'AUTH LOGIN', [334]);
+      await smtpCommand(state, Buffer.from(user, 'utf8').toString('base64'), [334]);
+      await smtpCommand(state, Buffer.from(pass, 'utf8').toString('base64'), [235]);
+    }
+    await smtpCommand(state, `MAIL FROM:<${from}>`, [250]);
+    await smtpCommand(state, `RCPT TO:<${to}>`, [250, 251]);
+    await smtpCommand(state, 'DATA', [354]);
+    const subj64 = Buffer.from(subject, 'utf8').toString('base64');
+    const body64 = Buffer.from(text, 'utf8').toString('base64').replace(/.{76}/g, '$&\r\n');
+    const msg = [
+      `From: ${from}`, `To: ${to}`, `Subject: =?UTF-8?B?${subj64}?=`,
+      'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: base64', '', body64, '.',
+    ].join('\r\n');
+    await smtpCommand(state, msg, [250]);
+    try { await smtpCommand(state, 'QUIT', [221]); } catch (e) { /* 已投递成功，QUIT 失败不算失败 */ }
+  } finally {
+    try { state.socket && state.socket.destroy(); } catch (e) {}
+  }
+}
+
+function siteBaseUrl(req) {
+  const env = (process.env.SITE_URL || '').replace(/\/$/, '');
+  if (env) return env;
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+  return `${proto}://${host}`;
+}
+
+/* 忘记密码：防枚举——账号存在与否返回完全一致；mailConfigured 只是系统级状态、不区分账号 */
+app.post('/api/auth/forgot-password', rlAuth, async (req, res) => {
+  const body = req.body || {};
+  const account = String(body.account || body.username || body.email || '').trim();
+  const db = loadDb();
+  const user = account ? db.users.find(u => u.username === account || u.email === account) : null;
+  if (user && !user.banned) {
+    const token = crypto.randomBytes(32).toString('hex');
+    user.resetTokenHash = sha256hex(token);
+    user.resetExpires = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    saveDb(db);
+    await flushNow();
+    const link = `${siteBaseUrl(req)}/reset-password?token=${token}`;
+    if (mailConfigured()) {
+      try {
+        await sendSmtpMail({
+          to: user.email,
+          subject: '【JM社区】重置你的密码',
+          text: `你好，${user.name || user.username}：\n\n你正在申请重置 JM 社区密码，点击下面的链接在 30 分钟内设置新密码：\n${link}\n\n重置成功后，所有已登录设备都会退出。若非本人操作，请忽略本邮件（密码不会被更改）。`,
+        });
+      } catch (e) {
+        console.error('[password-reset] 邮件发送失败：' + e.message + '；用户 ' + user.username + ' 的重置链接（管理员人工转交）：' + link);
+      }
+    } else {
+      console.warn('[password-reset] 邮件通道未配置（缺 SMTP_HOST/SMTP_FROM），用户 ' + user.username + ' 的重置链接（管理员人工转交）：' + link);
+    }
+  }
+  res.json({ ok: true, mailConfigured: mailConfigured() });
+});
+
+/* 重置密码：令牌哈希匹配 + 30 分钟内有效；成功后清令牌（一次性）并踢掉全部会话 */
+app.post('/api/auth/reset-password', rlAuth, async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) return res.status(400).json({ error: '参数不完整' });
+    if (String(newPassword).length < 6) return res.status(400).json({ error: '新密码至少 6 位' });
+    const db = loadDb();
+    const hash = sha256hex(String(token));
+    const user = db.users.find(u => u.resetTokenHash && u.resetTokenHash === hash);
+    if (!user || !user.resetExpires || new Date(user.resetExpires).getTime() <= Date.now()) {
+      return res.status(400).json({ error: '重置链接无效或已过期，请重新申请' });
+    }
+    user.passwordHash = hashPw(String(newPassword));
+    delete user.resetTokenHash;
+    delete user.resetExpires;
+    let kicked = 0;
+    for (const tk of Object.keys(db.sessions || {})) {
+      if (db.sessions[tk].userId === user.id) { delete db.sessions[tk]; kicked++; }
+    }
+    saveDb(db);
+    await flushNow();
+    res.json({ ok: true, kicked });
+  } catch (e) {
+    res.status(500).json({ error: '重置失败：' + e.message });
+  }
+});
+
+/* ---- 注册图形验证码（自研 SVG，零依赖）：仅免码窗开启或同 IP 1 小时无码尝试 ≥3 次时强制，带邀请码豁免 ---- */
+const captchaStore = new Map();    // id -> { answer, expires }，内存即可（多实例下每实例独立，与现有内存限流同口径）
+const regAttemptStore = new Map(); // ip -> [无码注册尝试时间戳]
+function clientIp(req) { return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '?'; }
+function captchaSvg(code) {
+  const W = 120, H = 44;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const colors = ['#334155', '#0e7490', '#b45309', '#be185d', '#166534', '#6d28d9'];
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><rect width="${W}" height="${H}" fill="#eef2f7"/>`;
+  for (let i = 0; i < 5; i++) s += `<line x1="${rnd(0, W) | 0}" y1="${rnd(0, H) | 0}" x2="${rnd(0, W) | 0}" y2="${rnd(0, H) | 0}" stroke="hsl(${rnd(0, 360) | 0},60%,72%)" stroke-width="1"/>`;
+  code.split('').forEach((ch, i) => {
+    const x = Math.round(16 + i * 26 + rnd(-3, 3));
+    const y = Math.round(31 + rnd(-4, 4));
+    const r = Math.round(rnd(-24, 24));
+    s += `<text x="${x}" y="${y}" font-size="26" font-weight="700" font-family="Verdana, Geneva, sans-serif" fill="${colors[i % colors.length]}" transform="rotate(${r} ${x} ${y})">${ch}</text>`;
+  });
+  for (let i = 0; i < 24; i++) s += `<circle cx="${rnd(0, W) | 0}" cy="${rnd(0, H) | 0}" r="${rnd(0.6, 1.8).toFixed(1)}" fill="hsl(${rnd(0, 360) | 0},50%,60%)" opacity="0.5"/>`;
+  return s + '</svg>';
+}
+function newCaptcha() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去掉易混淆的 0/O/1/I
+  let code = '';
+  for (let i = 0; i < 4; i++) code += chars[crypto.randomInt(chars.length)];
+  const cid = 'c' + crypto.randomBytes(12).toString('hex');
+  captchaStore.set(cid, { answer: code, expires: Date.now() + 5 * 60 * 1000 });
+  if (captchaStore.size > 500) { const now = Date.now(); for (const [k, v] of captchaStore) if (v.expires <= now) captchaStore.delete(k); }
+  return { id: cid, svg: captchaSvg(code) };
+}
+/* 一次性校验：无论答对答错，校验一次即失效，必须刷新 */
+function checkCaptcha(cid, answer) {
+  if (!cid) return false;
+  const rec = captchaStore.get(cid);
+  captchaStore.delete(cid);
+  if (!rec || rec.expires <= Date.now()) return false;
+  return String(answer || '').trim().toUpperCase() === rec.answer;
+}
+function regNeedCaptcha(db, req, hasCode) {
+  if (hasCode) return false;
+  if (regWindowState(db).open) return true;
+  const arr = (regAttemptStore.get(clientIp(req)) || []).filter(t => Date.now() - t < 3600 * 1000);
+  return arr.length >= 3;
+}
+function noteRegAttempt(req) {
+  const ip = clientIp(req);
+  const arr = (regAttemptStore.get(ip) || []).filter(t => Date.now() - t < 3600 * 1000);
+  arr.push(Date.now());
+  regAttemptStore.set(ip, arr);
+  if (regAttemptStore.size > 1000) { for (const [k, v] of regAttemptStore) if (!v.length || Date.now() - v[v.length - 1] > 3600 * 1000) regAttemptStore.delete(k); }
+}
+app.get('/api/auth/captcha', (req, res) => {
+  const c = newCaptcha();
+  res.json({ id: c.id, svg: c.svg });
+});
+app.get('/api/auth/reg-status', (req, res) => {
+  const db = loadDb();
+  res.json({ ...regWindowState(db), captchaRequired: regNeedCaptcha(db, req, false) });
+});
 
 /* ================= settings API ================= */
 app.get('/api/settings', requireAuth, (req, res) => {

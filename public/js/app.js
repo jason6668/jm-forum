@@ -70,6 +70,7 @@
       try { const j = await res.json(); msg = j.error || msg; extra = j; } catch (e) {}
       const err = new Error(msg);
       if (extra.needLevel) { err.needLevel = extra.needLevel; err.myLevel = extra.myLevel || 0; }
+      if (extra.needCaptcha) err.needCaptcha = true;
       throw err;
     }
     const d = await res.json();
@@ -536,6 +537,80 @@
     });
   }
 
+  /* ---------- 新用户一次性欢迎条 ----------
+     显示口径：已登录 + 注册未满 7 天 + 未点过关闭。/api/auth/me 不带注册时间，
+     用现成的 GET /api/users/:username 取 joinedAt，查一次即按用户缓存到 localStorage，
+     之后只读缓存；关闭按用户 id 记 forum-welcome-dismissed-<uid>，永久不再显示。 */
+  const WELCOME_DISMISS_PREFIX = 'forum-welcome-dismissed-';
+  const WELCOME_JOINED_PREFIX = 'forum-joined-';
+  const WELCOME_WINDOW_MS = 7 * 24 * 3600 * 1000;
+  let welcomeJoinedCache = null; /* { uid, joinedAt } 本会话内缓存，免每次进首页重复查 */
+  function welcomeDismissed(uid) {
+    try { return localStorage.getItem(WELCOME_DISMISS_PREFIX + uid) === '1'; } catch { return false; }
+  }
+  async function myJoinedAt() {
+    const u = state.user;
+    if (!u || !u.id) return null;
+    if (welcomeJoinedCache && welcomeJoinedCache.uid === u.id) return welcomeJoinedCache.joinedAt;
+    let joined = null;
+    try { joined = localStorage.getItem(WELCOME_JOINED_PREFIX + u.id) || null; } catch { /* 读不到缓存则走接口 */ }
+    if (!joined) {
+      try {
+        const me = await api('/api/users/' + encodeURIComponent(u.username), { silent: true });
+        joined = me && me.joinedAt ? String(me.joinedAt) : null;
+        if (joined) { try { localStorage.setItem(WELCOME_JOINED_PREFIX + u.id, joined); } catch { /* 隐私模式写不进，下次再查 */ } }
+      } catch { joined = null; }
+    }
+    welcomeJoinedCache = { uid: u.id, joinedAt: joined };
+    return joined;
+  }
+  async function welcomeBarHtml() {
+    const u = state.user;
+    if (!u || !u.id) return '';
+    if (welcomeDismissed(u.id)) return '';
+    const joined = await myJoinedAt();
+    if (!joined) return '';
+    const t = new Date(joined).getTime();
+    if (!Number.isFinite(t) || t > Date.now() || Date.now() - t > WELCOME_WINDOW_MS) return '';
+    const checked = (u.lastCheckin || '') === localToday();
+    return `
+      <div class="welcome-banner" id="welcomeBanner">
+        <span class="announce-ic">👋</span>
+        <span class="welcome-txt">欢迎来到 JM 社区，<strong>${esc(u.name || u.username)}</strong>！先把新人三件事安排上，每天都有新内容等你。</span>
+        <span class="welcome-actions">
+          ${checked
+            ? `<button type="button" class="btn btn-ghost btn-sm" id="welcomeCheckin" disabled>今日已签到 ✓</button>`
+            : `<button type="button" class="btn btn-primary btn-sm" id="welcomeCheckin">🍗 签到领鸡腿</button>`}
+          <a class="btn btn-outline btn-sm" href="/guide">📖 看新手教程</a>
+          <a class="btn btn-outline btn-sm" href="/compose">✍️ 发第一帖</a>
+        </span>
+        <button type="button" class="announce-close" id="welcomeClose" aria-label="关闭欢迎条">&times;</button>
+      </div>`;
+  }
+  function bindWelcomeBar() {
+    const banner = document.getElementById('welcomeBanner');
+    if (!banner) return;
+    const closeBtn = document.getElementById('welcomeClose');
+    if (closeBtn) closeBtn.addEventListener('click', () => {
+      if (state.user && state.user.id) {
+        try { localStorage.setItem(WELCOME_DISMISS_PREFIX + state.user.id, '1'); } catch { /* 写不进则仅本次移除 */ }
+      }
+      banner.remove();
+    });
+    const checkinBtn = document.getElementById('welcomeCheckin');
+    if (checkinBtn && !checkinBtn.disabled) checkinBtn.addEventListener('click', async () => {
+      checkinBtn.disabled = true;
+      await doCheckin();
+      if (state.user && state.user.lastCheckin === localToday()) {
+        checkinBtn.textContent = '今日已签到 ✓';
+        checkinBtn.classList.remove('btn-primary');
+        checkinBtn.classList.add('btn-ghost');
+      } else {
+        checkinBtn.disabled = false;
+      }
+    });
+  }
+
   async function renderHome(boardSlug, sort, page = 1, feed = '') {
     const qs = new URLSearchParams();
     if (feed === 'following') qs.set('following', '1');
@@ -546,6 +621,7 @@
     const pages = data.pages || 1;
     const cur = Math.min(page, pages);
     const annHtml = await announcementBannerHtml();
+    const welcomeHtml = await welcomeBarHtml();
     /* 关注流：只看关注的人发的帖子 */
     if (feed === 'following') {
       const buildUrl = (p) => '/?feed=following' + (p > 1 ? `&page=${p}` : '');
@@ -575,7 +651,7 @@
           </div>` : ''}`;
       }
       renderPage(`
-        ${annHtml}
+        ${annHtml}${welcomeHtml}
         <div class="card" style="padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
           <div style="font-weight:700">👀 关注动态</div>
           <div class="muted" style="font-size:13px">只看你关注的人发的帖子</div>
@@ -583,6 +659,7 @@
         ${topics.length ? postListHtml(topics) + (pages > 1 ? `<div class="card" style="padding:12px;margin-top:14px;display:flex;justify-content:center">${pager(cur, pages, buildUrl)}</div>` : '') : recHtml}
       `);
       bindAnnouncementBanner();
+      bindWelcomeBar();
       document.querySelectorAll('.follow-btn').forEach(b => b.addEventListener('click', async () => {
         if (!state.user) return route('/login?next=' + encodeURIComponent('/?feed=following'));
         try {
@@ -609,7 +686,7 @@
       return '/' + (s ? '?' + s : '');
     };
     renderPage(`
-      ${annHtml}
+      ${annHtml}${welcomeHtml}
       ${boardTabsHtml(boardSlug)}
       ${boardSlug === 'unemployment' ? `
         <a href="/companies" class="card comp-banner">
@@ -632,6 +709,7 @@
     `);
     bindSortTabs(boardSlug, sort || 'latest');
     bindAnnouncementBanner();
+    bindWelcomeBar();
     setNav('home');
   }
 
@@ -943,7 +1021,7 @@
           </ul>`)}
         ${sec('faq', '❓', '常见问题', `
           <ul>
-            <li><b>忘记密码？</b>目前请联系管理员重置。</li>
+            <li><b>忘记密码？</b>在<a href="/forgot-password">登录页点「忘记密码？」</a>用注册邮箱自助重置；若提示邮件通道未开通，请联系管理员。</li>
             <li><b>帖子被删了？</b>去 <a href="/ruling">/ruling</a> 查管理记录，公示了原因；有异议可私信管理员申诉。</li>
             <li><b>公司库相关问题</b>（搜不到公司、评价怎么写）→ 看上面「🏢 公司避雷库」一节。</li>
             <li><b>鸡腿不够用？</b>每日签到 + 多发优质帖，优质内容被点赞也有经验加速升级。</li>
@@ -1651,7 +1729,7 @@
           <div class="form-group">
             <label>密码</label>
             <input type="password" class="form-control" id="lPassword" required />
-            <div class="help-text">忘记密码？请联系社区管理员重置</div>
+            <div class="help-text"><a href="/forgot-password">忘记密码？</a> 用注册邮箱自助重置</div>
           </div>
           <button type="submit" class="btn btn-primary btn-block">登 录</button>
           <div class="error" id="formError"></div>
@@ -1680,24 +1758,130 @@
           <div class="form-group"><label>邮箱</label><input type="email" class="form-control" id="rEmail" required /></div>
           <div class="form-group"><label>邀请码</label><input type="text" class="form-control" id="rCode" required placeholder="JM-XXXXXXXX" style="text-transform:uppercase" /></div>
           <div class="form-group"><label>密码</label><input type="password" class="form-control" id="rPassword" required minlength="6" /></div>
+          <div class="form-group" id="captchaGroup" style="display:none">
+            <label>图形验证码</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input type="text" class="form-control" id="rCaptcha" maxlength="4" autocomplete="off" placeholder="输入图中字符（不分大小写）" style="flex:1;text-transform:uppercase" />
+              <span id="captchaImg" title="看不清？点击刷新" style="cursor:pointer;line-height:0;border:1px solid var(--line,#ddd);border-radius:6px;overflow:hidden"></span>
+            </div>
+            <div class="help-text">开放注册期间需要填写验证码验证；填了邀请码可免。</div>
+          </div>
           <button type="submit" class="btn btn-primary btn-block">注 册</button>
           <div class="error" id="formError"></div>
           <div class="form-foot">已有账号？<a href="/login?next=${encodeURIComponent(next)}">去登录</a></div>
         </form>
       </div>`);
+    /* 验证码：免码窗开启 / 同 IP 频繁尝试时后端要求。后端说需要才显示；填了邀请码自动隐藏（豁免） */
+    let captchaId = '';
+    let captchaWanted = false;
+    async function loadCaptcha() {
+      try {
+        const c = await api('/api/auth/captcha?t=' + Date.now(), { silent: true });
+        captchaId = c.id || '';
+        const img = document.getElementById('captchaImg');
+        if (img && c.svg) img.innerHTML = c.svg;
+      } catch (e) { /* 拉不到图时提交会被后端拦下并提示，不阻塞填表 */ }
+    }
+    function syncCaptcha() {
+      const grp = document.getElementById('captchaGroup');
+      if (!grp) return;
+      const codeVal = (document.getElementById('rCode') || {}).value || '';
+      const show = captchaWanted && !codeVal.trim();
+      grp.style.display = show ? '' : 'none';
+      if (show && !captchaId) loadCaptcha();
+    }
+    document.getElementById('captchaImg').addEventListener('click', () => { captchaId = ''; loadCaptcha(); });
+    document.getElementById('rCode').addEventListener('input', syncCaptcha);
     fetch('/api/auth/reg-status').then(r => r.json()).then(st => {
       if (st && st.open) {
         const c = document.getElementById('rCode');
         if (c) { c.required = false; c.placeholder = '🎉 开放注册中，邀请码可不填'; }
       }
+      if (st && st.captchaRequired) captchaWanted = true;
+      syncCaptcha();
     }).catch(() => {});
     document.getElementById('registerForm').addEventListener('submit', async e => {
       e.preventDefault();
+      const grp = document.getElementById('captchaGroup');
+      const body = { username: document.getElementById('rUsername').value.trim(), name: document.getElementById('rName').value.trim(), email: document.getElementById('rEmail').value.trim(), code: document.getElementById('rCode').value.trim(), password: document.getElementById('rPassword').value };
+      if (grp && grp.style.display !== 'none') {
+        body.captchaId = captchaId;
+        body.captchaAnswer = document.getElementById('rCaptcha').value.trim();
+      }
       try {
-        await api('/api/auth/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.getElementById('rUsername').value.trim(), name: document.getElementById('rName').value.trim(), email: document.getElementById('rEmail').value.trim(), code: document.getElementById('rCode').value.trim(), password: document.getElementById('rPassword').value }) });
+        await api('/api/auth/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         await initAuth();
         route(next);
-      } catch (err) { document.getElementById('formError').textContent = err.message; }
+      } catch (err) {
+        document.getElementById('formError').textContent = err.message;
+        if (err.needCaptcha) { captchaWanted = true; captchaId = ''; syncCaptcha(); loadCaptcha(); const ri = document.getElementById('rCaptcha'); if (ri) ri.value = ''; }
+      }
+    });
+  }
+
+  function renderForgot() {
+    renderPage(`
+      <div class="card auth-card">
+        <h2>🔑 忘记密码</h2>
+        <div class="help-text" style="margin-bottom:14px">输入你的用户名或注册邮箱，重置链接会发送到注册邮箱，30 分钟内有效。重置成功后所有设备都会退出登录。</div>
+        <form id="forgotForm">
+          <div class="form-group"><label>用户名或邮箱</label><input type="text" class="form-control" id="fAccount" required /></div>
+          <button type="submit" class="btn btn-primary btn-block">发送重置链接</button>
+          <div class="error" id="formError"></div>
+          <div id="formOk" style="display:none;margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:14px"></div>
+          <div class="form-foot">想起密码了？<a href="/login">去登录</a> · 还没账号？<a href="/register">立即注册</a></div>
+        </form>
+      </div>`);
+    document.getElementById('forgotForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const okEl = document.getElementById('formOk');
+      const errEl = document.getElementById('formError');
+      okEl.style.display = 'none';
+      errEl.textContent = '';
+      try {
+        const r = await api('/api/auth/forgot-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account: document.getElementById('fAccount').value.trim() }) });
+        /* 防枚举：文案只随「邮件通道是否开通」变化，不随账号是否存在变化 */
+        okEl.textContent = (r && r.mailConfigured)
+          ? '✅ 如果该账号存在，重置链接已发送到注册邮箱，请在 30 分钟内完成重置（没收到先看看垃圾箱）。'
+          : '⚠️ 本站邮件通道尚未开通，暂时无法自助重置，请联系管理员重置密码。';
+        okEl.style.display = '';
+      } catch (err) { errEl.textContent = err.message; }
+    });
+  }
+
+  function renderReset() {
+    const token = new URLSearchParams(location.search).get('token') || '';
+    if (!token) {
+      renderPage(`
+        <div class="card auth-card">
+          <h2>🔑 重置密码</h2>
+          <p class="help-text">链接不完整或已失效。请从邮箱里的重置链接重新打开，或 <a href="/forgot-password">重新申请</a>。</p>
+          <div class="form-foot"><a href="/login">去登录</a></div>
+        </div>`);
+      return;
+    }
+    renderPage(`
+      <div class="card auth-card">
+        <h2>🔑 设置新密码</h2>
+        <form id="resetForm">
+          <div class="form-group"><label>新密码</label><input type="password" class="form-control" id="nPassword" required minlength="6" autocomplete="new-password" /></div>
+          <div class="form-group"><label>再输入一次</label><input type="password" class="form-control" id="nPassword2" required minlength="6" autocomplete="new-password" /></div>
+          <button type="submit" class="btn btn-primary btn-block">确认重置</button>
+          <div class="error" id="formError"></div>
+          <div class="form-foot">重置成功后，所有已登录设备都会退出。<a href="/login">去登录</a></div>
+        </form>
+      </div>`);
+    document.getElementById('resetForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      const p1 = document.getElementById('nPassword').value;
+      const p2 = document.getElementById('nPassword2').value;
+      const errEl = document.getElementById('formError');
+      if (p1 !== p2) { errEl.textContent = '两次输入的密码不一致'; return; }
+      try {
+        await api('/api/auth/reset-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, newPassword: p1 }) });
+        toast('密码已重置，请用新密码登录');
+        route('/login');
+      } catch (err) { errEl.textContent = err.message; }
     });
   }
 
@@ -2385,7 +2569,7 @@
         <details><summary><strong>公司避雷库的数据来源？</strong></summary><p style="padding:8px 0">数据来源于全国工商注册公开信息（1978-2019年），涵盖 31 个省份 580 万+ 家企业。所有访客均可添加公司或发表评价，评价将匿名展示并自动保存。</p></details>
         <details><summary><strong>评价是真实的吗？</strong></summary><p style="padding:8px 0">评价来自网友真实经历，仅供参考，不构成任何法律意见。我们鼓励基于事实的客观评价，禁止恶意诽谤。如发现不实评价，可向管理员举报。</p></details>
         <details><summary><strong>如何添加避雷公司？</strong></summary><p style="padding:8px 0">在公司避雷库页面点击"➕ 添加公司"按钮，填写公司信息后提交。提交后需管理员审核通过才会显示在避雷库中。</p></details>
-        <details><summary><strong>忘记密码怎么办？</strong></summary><p style="padding:8px 0">请联系社区管理员重置密码。</p></details>
+        <details><summary><strong>忘记密码怎么办？</strong></summary><p style="padding:8px 0">在登录页点「忘记密码？」，用注册邮箱自助重置（链接 30 分钟内有效）；若页面提示邮件通道未开通，请联系社区管理员重置。</p></details>
       </div>
       <div class="card" style="margin-bottom:14px">
         <h3>📂 社区板块</h3>
@@ -3764,6 +3948,8 @@
     else if (path === '/compose') setTitle('发帖');
     else if (path === '/login') setTitle('登录');
     else if (path === '/register') setTitle('注册');
+    else if (path === '/forgot-password') setTitle('忘记密码');
+    else if (path === '/reset-password') setTitle('重置密码');
     else if (path === '/favorites') setTitle('我的收藏');
     else if (path === '/search') setTitle('搜索');
     else if (path === '/messages') setTitle('私信');
@@ -3806,6 +3992,8 @@
       if (path === '/compose') { await renderCompose(); return; }
       if (path === '/login') { renderLogin(); return; }
       if (path === '/register') { renderRegister(); return; }
+      if (path === '/forgot-password') { renderForgot(); return; }
+      if (path === '/reset-password') { renderReset(); return; }
       if (path === '/favorites') { await renderFavorites(); return; }
       if (path === '/search') { await renderSearch(params.get('q') || ''); return; }
       if (path === '/messages' || path === '/messages/') { await renderMessages(); return; }
