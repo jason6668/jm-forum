@@ -270,30 +270,107 @@ function migrate(db) {
   }
   /* ⚽ 体育专区（对标虎扑：各球类独立板块） */
   const SPORT_BOARDS = [
-    { name: '篮球', slug: 'basketball', color: '#f97316', description: 'NBA、CBA、野球场：聊球看球评球' },
-    { name: '足球', slug: 'football', color: '#22c55e', description: '五大联赛、中超、欧冠：世界第一运动' },
-    { name: '网球', slug: 'tennis', color: '#a3e635', description: '四大满贯、ATP、WTA' },
-    { name: '羽毛球', slug: 'badminton', color: '#eab308', description: '苏杯汤尤杯、世锦赛、奥运争光' },
-    { name: '乒乓球', slug: 'pingpong', color: '#ef4444', description: 'WTT、世乒赛，国球无敌' },
-    { name: '排球', slug: 'volleyball', color: '#3b82f6', description: '中国女排、联赛、世锦赛' },
-    { name: '台球', slug: 'billiards', color: '#8b5cf6', description: '斯诺克、中式八球、九球' },
-    { name: '棒球', slug: 'baseball', color: '#f43f5e', description: 'MLB、日职棒、世界棒球经典赛' },
-    { name: '高尔夫', slug: 'golf', color: '#10b981', description: '大满贯、PGA、挥杆人生' },
-    { name: '电竞', slug: 'esports', color: '#6366f1', description: 'LOL、CS2、王者荣耀、DOTA2' },
-    { name: '综合体育', slug: 'sports', color: '#06b6d4', description: '田径、游泳、F1、健身及其他运动' },
+    { name: '体育', slug: 'sports', color: '#06b6d4', description: '足球、篮球、网球、羽毛球、乒乓球、电竞……聊球看球评球都在这' },
   ];
   SPORT_BOARDS.forEach(s => {
     if (!db.boards.find(b => b.slug === s.slug)) {
       db.boards.push({ id: id('b'), name: s.name, slug: s.slug, color: s.color, description: s.description, topicCount: 0, weight: 100 + SPORT_BOARDS.indexOf(s) * 10 });
     }
   });
-  /* 福利分享板块（对标 linux.do 福利区） */
-  if (!db.boards.find(b => b.slug === 'fuli')) {
-    db.boards.push({ id: id('b'), name: '福利分享', slug: 'fuli', color: '#f59e0b', description: '羊毛福利、资源分享、网盘互助', topicCount: 0, weight: 95,
-      topicTemplate: '【福利名称】\n\n【领取方式】\n\n【有效期】\n\n【备注】' });
-  }
   /* 板块排序权重：老板块按原顺序 */
   db.boards.forEach((b, i) => { if (typeof b.weight !== 'number') b.weight = (i + 1) * 10; });
+  /* 🧩 板块合并 24→11（一次性，2026-10-07 用户确认）：小板块并入大类，老帖全部改归新板不删 */
+  if (!db.boardMergeV1) {
+    const MERGE = { dev: 'tech', fuli: 'trade', basketball: 'sports', football: 'sports', tennis: 'sports', badminton: 'sports', pingpong: 'sports', volleyball: 'sports', billiards: 'sports', baseball: 'sports', golf: 'sports', esports: 'sports', moments: 'blog' };
+    const RENAMES = { trade: '交易福利', sports: '体育', blog: '同步动态' };
+    const idToSlug = {};
+    db.boards.forEach(b => { idToSlug[b.id] = b.slug; });
+    const deadIds = new Set(db.boards.filter(b => MERGE[b.slug]).map(b => b.id));
+    let droppedWelcome = 0;
+    db.topics = db.topics.filter(t => { if (deadIds.has(t.boardId) && t.boardSeed) { droppedWelcome++; return false; } return true; });
+    let movedTopics = 0;
+    for (const t of db.topics) {
+      const s = idToSlug[t.boardId];
+      if (s && MERGE[s]) {
+        const tgt = db.boards.find(b => b.slug === MERGE[s]);
+        if (tgt) { t.boardId = tgt.id; movedTopics++; }
+      }
+    }
+    for (const [s, n] of Object.entries(RENAMES)) {
+      const b = db.boards.find(b => b.slug === s);
+      if (b) b.name = n;
+    }
+    for (const t of db.topics) {
+      if (!t.boardSeed) continue;
+      const b = db.boards.find(x => x.id === t.boardId);
+      if (!b) continue;
+      t.title = `📌 欢迎来到「${b.name}」：本版说明与发帖示范`;
+      const p0 = (t.posts || [])[0];
+      if (p0) p0.content = boardWelcomeContent(b);
+    }
+    db.boards = db.boards.filter(b => !MERGE[b.slug]);
+    const counts = {};
+    db.topics.forEach(t => { counts[t.boardId] = (counts[t.boardId] || 0) + 1; });
+    const WEIGHTS = { news: 15, daily: 20, chigua: 25, 'tg-treehole': 30, info: 35, unemployment: 40, tech: 50, review: 60, trade: 70, sports: 80, blog: 90 };
+    db.boards.forEach(b => { b.topicCount = counts[b.id] || 0; if (WEIGHTS[b.slug]) b.weight = WEIGHTS[b.slug]; });
+    db.boardMergeV1 = { at: nowIso(), movedTopics, droppedWelcome };
+  }
+  /* 🧩 板块合并二期（一次性，2026-10-07 用户确认）：情报并入日常。 */
+  if (!db.boardMergeV2) {
+    const srcB = db.boards.find(b => b.slug === 'info');
+    const tgtB = db.boards.find(b => b.slug === 'daily');
+    let moved2 = 0;
+    if (srcB && tgtB) {
+      db.topics = db.topics.filter(t => !(t.boardId === srcB.id && t.boardSeed));
+      for (const t of db.topics) if (t.boardId === srcB.id) { t.boardId = tgtB.id; moved2++; }
+      db.boards = db.boards.filter(b => b.slug !== 'info');
+      const counts2 = {};
+      db.topics.forEach(t => { counts2[t.boardId] = (counts2[t.boardId] || 0) + 1; });
+      db.boards.forEach(b => { b.topicCount = counts2[b.id] || 0; });
+    }
+    db.boardMergeV2 = { at: nowIso(), movedTopics: moved2 };
+  }
+  /* 🧹 重复新闻清理（一次性，2026-10-08 用户拍板）：同题新闻只留评论多的那份。
+     GPT-6 进入 ChatGPT：LoopDNS 版（tpmuzgc99b9h916s）0 评论、在花科技圈版 27 评论，
+     删 LoopDNS 版。板块计数与收藏清理同管理员删帖口径。Haiku 一事另有三份并存，
+     不在本批，等用户另行拍板。 */
+  if (!db.dupDeleteV1) {
+    const DUP_DELETE_IDS = ['tpmuzgc99b9h916s'];
+    const removedDup = [];
+    for (const dupId of DUP_DELETE_IDS) {
+      const dupIdx = db.topics.findIndex(t => t.id === dupId);
+      if (dupIdx < 0) continue;
+      const dupTopic = db.topics[dupIdx];
+      if (!dupTopic.status || dupTopic.status === 'published') {
+        const dupBoard = db.boards.find(b => b.id === dupTopic.boardId);
+        if (dupBoard) dupBoard.topicCount = Math.max(0, (dupBoard.topicCount || 1) - 1);
+      }
+      db.topics.splice(dupIdx, 1);
+      db.users.forEach(u => { const f = u.favorites || []; const fi = f.indexOf(dupId); if (fi >= 0) f.splice(fi, 1); });
+      removedDup.push(dupId);
+    }
+    db.dupDeleteV1 = { at: nowIso(), removed: removedDup };
+  }
+  /* 🧹 重复新闻清理二期（一次性，2026-10-08 用户拍板）：Haiku 5.5 一事三份并存，
+     用户定只删 0 评论的 LoopDNS 版（tpmuzgc99dz9c1ak），另两份（23/29 评论）保留。
+     删帖+板块计数-1+收藏清理，同 dupDeleteV1 口径。 */
+  if (!db.dupDeleteV2) {
+    const DUP_DELETE_IDS_V2 = ['tpmuzgc99dz9c1ak'];
+    const removedDupV2 = [];
+    for (const dupId of DUP_DELETE_IDS_V2) {
+      const dupIdx = db.topics.findIndex(t => t.id === dupId);
+      if (dupIdx < 0) continue;
+      const dupTopic = db.topics[dupIdx];
+      if (!dupTopic.status || dupTopic.status === 'published') {
+        const dupBoard = db.boards.find(b => b.id === dupTopic.boardId);
+        if (dupBoard) dupBoard.topicCount = Math.max(0, (dupBoard.topicCount || 1) - 1);
+      }
+      db.topics.splice(dupIdx, 1);
+      db.users.forEach(u => { const f = u.favorites || []; const fi = f.indexOf(dupId); if (fi >= 0) f.splice(fi, 1); });
+      removedDupV2.push(dupId);
+    }
+    db.dupDeleteV2 = { at: nowIso(), removed: removedDupV2 };
+  }
   /* 📰 品牌纠正（一次性，2026-10-07 用户定）：每日新闻播报是「马老师专属新闻」，不是吃瓜区。
      机器人改名、存量「每日吃瓜速报」系列帖改新标题（日期保留，与新发帖去重口径一致）、
      移入 news 板块、首帖来源行/结尾行换新文案、两边板块帖数同步校正。只动 newsbot 的该系列帖。 */
@@ -355,6 +432,296 @@ function migrate(db) {
     if (!u.lastCheckin && u.checkinCoins > 0) u.checkinCount = 1;
     if (!Array.isArray(u.following)) u.following = [];
   });
+  /* 🧹 2026-10-09 三件套收尾（每次 boot 幂等自检，防旧实例整库回写把已清理状态冲掉）：
+   * 1) 分片合并出现同 id 重复话题时去重（保留楼层多、更新的一份），避免列表重复与计数虚高；
+   * 2) 已合并板块（fuli→trade、体育子板→sports 等）若被旧快照带回，按映射改归父板后删除；
+   * 3) 三条置顶欢迎帖合一：只并真实存在的楼层，回复数按实际楼层重算，绝不虚增。 */
+  let forumCleanupChanged = false;
+  const dedupeBestById = new Map();
+  for (const t of db.topics) {
+    const cur = dedupeBestById.get(t.id);
+    if (!cur) { dedupeBestById.set(t.id, t); continue; }
+    const curPosts = (cur.posts || []).length, newPosts = (t.posts || []).length;
+    if (newPosts > curPosts || (newPosts === curPosts && String(t.bumpedAt || '') > String(cur.bumpedAt || ''))) dedupeBestById.set(t.id, t);
+  }
+  if (dedupeBestById.size !== db.topics.length) {
+    const beforeDedupe = db.topics.length;
+    db.topics = Array.from(dedupeBestById.values());
+    db.topicDedupeV1 = { at: nowIso(), before: beforeDedupe, after: db.topics.length, removed: beforeDedupe - db.topics.length };
+    forumCleanupChanged = true;
+  }
+  const mergedBoardParents = { dev: 'tech', fuli: 'trade', basketball: 'sports', football: 'sports', tennis: 'sports', badminton: 'sports', pingpong: 'sports', volleyball: 'sports', billiards: 'sports', baseball: 'sports', golf: 'sports', esports: 'sports', moments: 'blog', info: 'daily' };
+  const removedBoardSlugs = [];
+  for (const b of [...db.boards]) {
+    const parentSlug = mergedBoardParents[b.slug];
+    if (!parentSlug) continue;
+    const parent = db.boards.find(x => x.slug === parentSlug);
+    if (parent) for (const t of db.topics) if (t.boardId === b.id) { t.boardId = parent.id; forumCleanupChanged = true; }
+    db.boards = db.boards.filter(x => x.id !== b.id);
+    removedBoardSlugs.push(b.slug);
+    forumCleanupChanged = true;
+  }
+  if (removedBoardSlugs.length) db.boardCleanupV1 = { at: nowIso(), removed: removedBoardSlugs };
+  const welcomeTitleTarget = '欢迎来到 JM 社区 —— 新人必读 · 版规与使用指南';
+  const welcomeGuide = [
+    '大家好，我是马老师。欢迎来到 JM 社区，先花两分钟把这篇看完，能少走很多弯路。',
+    '',
+    '这里是给普通人抱团的地方：找工作避坑、聊生活、交换信息、买卖闲置、问技术问题，都行。不是广告墙，也不是戾气场——把话说清、把事办成，是这里的规矩。',
+    '',
+    '【第一次来，先做三件事】',
+    '1. 找工作、面试、入职前，先去顶部导航的「避雷库」搜公司全名，看完评价再决定。',
+    '2. 有问题先用搜索看看有没有人聊过，没找到再发帖，能省很多重复问答。',
+    '3. 涉及买卖和钱，先看本篇的交易规范，站内私信留痕，别急着转账。',
+    '',
+    '【十个板块，各发什么】',
+    '- 日常：聊天灌水、生活日常、吃喝玩乐、心情记录。标题把事说清就行，配图更欢迎。',
+    '- 吃瓜区：热点八卦、瓜田速报。标题写清主体，正文给来源；没证实的瓜注明「网传」，不传谣。',
+    '- 树洞：心里话、难开口的经历。聊天树洞频道、电报投稿机器人、论坛树洞帖（审核后）都会同步到这，想匿名按投稿向导选匿名。',
+    '- 马老师专属新闻：每天早上 8 点自动抓取全网热榜整理成帖，想聊哪条直接在当天新闻帖下回帖。',
+    '- 失业联盟：求职互助。标题写清城市+方向+经验，比如《重庆 · 3 年运维 · 求内推》；招聘帖写明公司与薪资范围。',
+    '- 技术：服务器、网络、编程、运维。提问带上环境、版本和完整报错，贴日志比说「打不开」有用一百倍。',
+    '- 测评：产品和服务的真实体验。优缺点分开写，最后说清适合谁；厂商邀约的测评要在文首标注。',
+    '- 交易福利：买卖求购。标题用【出售】/【求购】+物品+价格，正文写配置、成色、交付方式。',
+    '- 体育：足球、篮球、网球、电竞都在这。标题写清项目和队伍，理性评球，不引战。',
+    '- 同步动态：博客和聊天动态的自动同步区，以围观回帖为主，日常话题请去对应板块。',
+    '',
+    '【避雷库怎么用】',
+    '入口在顶部导航。先搜公司全名（简称容易漏），重点看评价的时间、岗位和具体细节。自己写评价要基于真实经历：城市、岗位、大概时间、发生了什么，写事实、少写情绪判断。手机号、身份证、同事姓名这类隐私一律打码。',
+    '',
+    '【发帖与评论规范】',
+    '标题说清一件事：一帖一事，背景+问题+你试过什么，别人才能帮上忙。不刷屏连发，不标题党。评论对事不对人，不人身攻击，不引战；补充信息带上来源，好评论会被顶上去。',
+    '',
+    '【交易规范】',
+    '必须标价格：物品、配置/成色、交付方式、售后边界一次写清。全程站内私信沟通留痕，先款有风险，贵重物品建议担保或当面。自称官方、催你脱离站内交易的，基本都是骗子。被骗了带着聊天记录和帖子链接找管理员处理。',
+    '',
+    '【鸡腿与等级怎么涨】',
+    '鸡腿是站内积分，签到、发帖、回复、获得点赞都会慢慢攒；经验涨等级，等级越高，能看的等级帖和能用的功能越多。具体数值以个人页显示为准，不用刷、不用灌水，认真写的内容涨得最快。',
+    '',
+    '【求助与投稿走哪条路】',
+    '技术问题去技术板块，求职抱团去失业联盟，公司避坑先搜避雷库。树洞投稿三条路：马老师专属聊天的树洞频道、电报投稿机器人、论坛树洞板块发帖（普通用户先经管理审核）；想匿名务必在投稿时选匿名。',
+    '',
+    '【违规处理与找管理员】',
+    '广告引流、诈骗、人身攻击、违法侵权内容会删帖，情节严重直接封号；处理记录在管理记录里公示，谁都能看。觉得被误判，把帖子链接和截图私信管理员申诉，别另开新帖刷屏。',
+    '',
+    '最后：先逛两天再开口也完全没问题。看到好帖顺手点个赞，看到新朋友的问题你能答就答一句——社区就是这么热起来的。祝大家在这里少踩坑，多办事。'
+  ].join('\n');
+  const welcomeCandidates = db.topics.filter(t => t && (t.id === 'tpmsr8lnoqzl7bhg' || t.id === 'tpmsr8lnoqnasp8e' || t.slug === 'welcome' || /欢迎来到 JM 社区|社区版规与使用指南/.test(t.title || '')));
+  if (welcomeCandidates.length) {
+    const keeper = welcomeCandidates.find(t => t.id === 'tpmsr8lnoqzl7bhg') || [...welcomeCandidates].sort((a, b) => ((b.posts || []).length - (a.posts || []).length) || String(a.createdAt || '').localeCompare(String(b.createdAt || '')))[0];
+    const keeperPosts = Array.isArray(keeper.posts) ? keeper.posts : [];
+    const keeperOp = keeperPosts[0] || { id: id('p'), topicId: keeper.id, userId: keeper.userId, content: '', createdAt: keeper.createdAt || nowIso(), likeCount: 0, postNumber: 1 };
+    const seenPostIds = new Set();
+    const mergedReplies = [];
+    for (const cand of welcomeCandidates) {
+      const posts = Array.isArray(cand.posts) ? cand.posts : [];
+      posts.forEach((p, idx) => {
+        if (idx === 0) return;
+        if (!p || seenPostIds.has(p.id)) return;
+        seenPostIds.add(p.id);
+        mergedReplies.push({ ...p, topicId: keeper.id });
+      });
+    }
+    mergedReplies.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    const newPosts = [{ ...keeperOp, topicId: keeper.id, postNumber: 1, content: welcomeGuide }, ...mergedReplies.map((p, i) => ({ ...p, postNumber: i + 2 }))];
+    const removedWelcomeIds = welcomeCandidates.filter(t => t.id !== keeper.id).map(t => t.id);
+    const welcomeChanged = removedWelcomeIds.length > 0 || keeper.title !== welcomeTitleTarget || JSON.stringify(keeperPosts) !== JSON.stringify(newPosts);
+    if (welcomeChanged) {
+      keeper.title = welcomeTitleTarget;
+      keeper.posts = newPosts;
+      keeper.pinned = true;
+      keeper.tags = Array.from(new Set([...(keeper.tags || []), '公告']));
+      keeper.replyCount = Math.max(0, newPosts.length - 1);
+      const latestPostAt = newPosts.reduce((m, p) => String(p.createdAt || '') > m ? String(p.createdAt || '') : m, '');
+      if (latestPostAt) keeper.bumpedAt = latestPostAt;
+      if (removedWelcomeIds.length) {
+        const removedSet = new Set(removedWelcomeIds);
+        db.topics = db.topics.filter(t => !removedSet.has(t.id));
+        db.users.forEach(u => { if (Array.isArray(u.favorites)) u.favorites = u.favorites.filter(f => !removedSet.has(f)); });
+      }
+      db.welcomeMergeV1 = { at: nowIso(), keeperId: keeper.id, removedIds: removedWelcomeIds, realPosts: newPosts.length, replyCount: keeper.replyCount };
+      forumCleanupChanged = true;
+    }
+  }
+  if (forumCleanupChanged) {
+    const recount = {};
+    db.topics.forEach(t => { recount[t.boardId] = (recount[t.boardId] || 0) + 1; });
+    db.boards.forEach(b => { b.topicCount = recount[b.id] || 0; });
+  }
+  /* 欢迎帖报到补位（一次性，2026-10-09 用户定）：官方小助手阿森（jmhelper）在欢迎帖末尾
+     补一条明牌欢迎 + 报到引导，只补这一条。幂等双守卫：标志位在则跳过；标志位丢了但帖里
+     已有阿森的发言也只补标志不重复发。找不到帖或助手号时不置位，下轮 boot 再试。 */
+  if (!db.welcomeHelperPingV1) {
+    const helper = db.users.find(u => u.username === 'jmhelper');
+    const welcomeTopic = db.topics.find(t => t.id === 'tpmsr8lnoqzl7bhg' || String(t.id || '').endsWith('zl7bhg'));
+    if (helper && welcomeTopic && Array.isArray(welcomeTopic.posts) && welcomeTopic.posts.length) {
+      if (!welcomeTopic.posts.some(p => p && p.userId === helper.id)) {
+        const time = nowIso();
+        welcomeTopic.posts.push({ id: id('p'), topicId: welcomeTopic.id, userId: helper.id, content: '新人看这里，我是社区小助手阿森 🐣 这条帖就是咱们的报到处：新来的朋友在下面留一句——你从哪儿来、想在社区找点什么（求职避坑、问技术、买卖闲置、纯聊天都行），老住户看到顺手就能给你指路。找工作、面试前先搜顶部「避雷库」看看公司评价；发帖先瞄一眼首楼的板块地图，别跑错地方。欢迎落座，有事喊我，喊不动的我去喊站长。', createdAt: time, likeCount: 0, postNumber: welcomeTopic.posts.length + 1 });
+        welcomeTopic.replyCount = welcomeTopic.posts.length - 1;
+        welcomeTopic.bumpedAt = time;
+      }
+      db.welcomeHelperPingV1 = { at: nowIso(), topicId: welcomeTopic.id, posts: welcomeTopic.posts.length, replyCount: welcomeTopic.replyCount };
+    }
+  }
+  /* 🧹 一次性清理（2026-10-09 用户授权）：删帖实测临时账号 deltest1009（umv0l0e8q9b37mj）。
+     幂等：标志位在则跳过；账号不存在时只补标志、不报错、绝不误伤其他用户。
+     线上核验其足迹为 0 帖 0 评论 0 互动，本块仍按通用安全顺序写：名下话题整帖移除→
+     它在他人帖下的评论移除并重排楼层（postNumber 连续、replyCount 按真实楼层重算）→
+     清点赞/关注/屏蔽/收藏引用→清它的通知与会话→移除用户本体。板块计数在有删帖时复算。 */
+  if (!db.cleanupDeltestV1) {
+    const targetId = 'umv0l0e8q9b37mj';
+    const targetName = 'deltest1009';
+    const target = (db.users || []).find(u => u && (u.id === targetId || u.username === targetName));
+    let removedTopics = 0, removedPosts = 0;
+    if (target) {
+      const uid = target.id;
+      const myTopicIds = new Set((db.topics || []).filter(t => t && t.userId === uid).map(t => t.id));
+      removedTopics = myTopicIds.size;
+      if (myTopicIds.size) db.topics = db.topics.filter(t => !myTopicIds.has(t.id));
+      for (const t of db.topics || []) {
+        if (!Array.isArray(t.posts)) continue;
+        const kept = t.posts.filter(p => !(p && p.userId === uid));
+        if (kept.length !== t.posts.length) {
+          removedPosts += t.posts.length - kept.length;
+          t.posts = kept.map((p, i) => ({ ...p, postNumber: i + 1 }));
+          t.replyCount = Math.max(0, t.posts.length - 1);
+        }
+      }
+      for (const t of db.topics || []) {
+        if (Array.isArray(t.likedUsers)) t.likedUsers = t.likedUsers.filter(x => x !== uid);
+        if (Array.isArray(t.dislikedUsers)) t.dislikedUsers = t.dislikedUsers.filter(x => x !== uid);
+        for (const p of (t.posts || [])) if (p && Array.isArray(p.likedUsers)) p.likedUsers = p.likedUsers.filter(x => x !== uid);
+      }
+      for (const u of db.users || []) {
+        if (!u) continue;
+        if (Array.isArray(u.following)) u.following = u.following.filter(x => x !== uid);
+        if (Array.isArray(u.blocked)) u.blocked = u.blocked.filter(x => x !== uid);
+        if (Array.isArray(u.favorites)) u.favorites = u.favorites.filter(f => !myTopicIds.has(f));
+      }
+      if (Array.isArray(db.notifications)) db.notifications = db.notifications.filter(n => !(n && (n.userId === uid || n.fromId === uid || myTopicIds.has(n.topicId))));
+      if (db.sessions) for (const k of Object.keys(db.sessions)) if (db.sessions[k] && db.sessions[k].userId === uid) delete db.sessions[k];
+      db.users = db.users.filter(u => u.id !== uid);
+      if (removedTopics > 0) {
+        const recount = {};
+        db.topics.forEach(t => { recount[t.boardId] = (recount[t.boardId] || 0) + 1; });
+        db.boards.forEach(b => { b.topicCount = recount[b.id] || 0; });
+      }
+    }
+    db.cleanupDeltestV1 = { at: nowIso(), username: targetName, userId: targetId, found: !!target, removedTopics, removedPosts };
+  }
+  /* 🧹 一次性清理（2026-10-09）：「开了免费注册还要邀请码」修复验证的 7 个真实注册测试号。
+     定点按用户 ID 清除（仿 cleanupDeltestV1 安全顺序）：名下话题/评论、点赞关注收藏引用、
+     通知、会话一并清掉，并把它们消费掉的注册码用量回滚（usedByList/usedCount/usedAt），
+     测完用户数回到 207。这批号除注册外无发言足迹，流程仍按通用顺序写以防万一。 */
+  if (!db.cleanupRegtestV1) {
+    const targets = [
+      ['umv14ddbxxdmnmy', 'regtest10090'], ['umv14h976el71gj', 'regtest10091'], ['umv14kthc6riiv6', 'regtest10092'],
+      ['umv15s8uhh4aqyv', 'regtest1009d'], ['umv15wgr9k2pixe', 'regtest1009e'],
+      ['umv15z3l3jdvnu1', 'regtest1009f'], ['umv16bbic8k02gm', 'regtest1009h'],
+    ];
+    let removedUsers = 0, removedTopics = 0, removedPosts = 0, restoredCodes = 0;
+    const removedIds = [];
+    for (const [tid, tname] of targets) {
+      const target = (db.users || []).find(u => u && (u.id === tid || u.username === tname));
+      if (!target) continue;
+      const uid = target.id;
+      removedIds.push(uid);
+      const myTopicIds = new Set((db.topics || []).filter(t => t && t.userId === uid).map(t => t.id));
+      removedTopics += myTopicIds.size;
+      if (myTopicIds.size) db.topics = db.topics.filter(t => !myTopicIds.has(t.id));
+      for (const t of db.topics || []) {
+        if (Array.isArray(t.posts)) {
+          const kept = t.posts.filter(p => !(p && p.userId === uid));
+          if (kept.length !== t.posts.length) {
+            removedPosts += t.posts.length - kept.length;
+            t.posts = kept.map((p, i) => ({ ...p, postNumber: i + 1 }));
+            t.replyCount = Math.max(0, t.posts.length - 1);
+          }
+        }
+        if (Array.isArray(t.likedUsers)) t.likedUsers = t.likedUsers.filter(x => x !== uid);
+        if (Array.isArray(t.dislikedUsers)) t.dislikedUsers = t.dislikedUsers.filter(x => x !== uid);
+        for (const p of (t.posts || [])) if (p && Array.isArray(p.likedUsers)) p.likedUsers = p.likedUsers.filter(x => x !== uid);
+      }
+      for (const u of db.users || []) {
+        if (!u) continue;
+        if (Array.isArray(u.following)) u.following = u.following.filter(x => x !== uid);
+        if (Array.isArray(u.blocked)) u.blocked = u.blocked.filter(x => x !== uid);
+        if (Array.isArray(u.favorites)) u.favorites = u.favorites.filter(f => !myTopicIds.has(f));
+      }
+      if (Array.isArray(db.notifications)) db.notifications = db.notifications.filter(n => !(n && (n.userId === uid || n.fromId === uid || myTopicIds.has(n.topicId))));
+      if (db.sessions) for (const k of Object.keys(db.sessions)) if (db.sessions[k] && db.sessions[k].userId === uid) delete db.sessions[k];
+      for (const c of db.regCodes || []) {
+        if (!c) continue;
+        let touched = false;
+        if (Array.isArray(c.usedByList) && c.usedByList.includes(uid)) { c.usedByList = c.usedByList.filter(x => x !== uid); touched = true; }
+        if (c.usedBy === uid) { c.usedBy = ''; c.usedAt = ''; touched = true; }
+        if (touched) { c.usedCount = Array.isArray(c.usedByList) && c.usedByList.length ? c.usedByList.length : (c.usedBy ? 1 : 0); restoredCodes++; }
+      }
+      db.users = db.users.filter(u => u.id !== uid);
+      removedUsers++;
+    }
+    if (removedTopics > 0) {
+      const recount = {};
+      db.topics.forEach(t => { recount[t.boardId] = (recount[t.boardId] || 0) + 1; });
+      db.boards.forEach(b => { b.topicCount = recount[b.id] || 0; });
+    }
+    db.cleanupRegtestV1 = { at: nowIso(), removedUsers, removedTopics, removedPosts, restoredCodes, ids: removedIds };
+  }
+  /* 📥 博客同步帖归板自检（2026-10-09 用户定：「论坛同步的博客内容全部放在同步动态，不要在首页」）：
+     blogbot 发的博客同步帖（作者 blogbot / 标签「博客同步」/ 前缀「博客」三种口径任一命中）
+     boardId 统一归到 slug=blog 的「同步动态」板。每次 boot 幂等自检（仿 boardCleanupV1）：
+     只挪不在 blog 板的散帖并按真实话题数重算受影响板块计数；已归位的帖与正文/评论/时间分毫不动。 */
+  {
+    const blogBoard = (db.boards || []).find(b => b && b.slug === 'blog');
+    const blogBot = (db.users || []).find(u => u && u.username === 'blogbot');
+    if (blogBoard) {
+      let moved = 0;
+      for (const t of db.topics || []) {
+        if (!t || t.boardId === blogBoard.id) continue;
+        const isBlogSync = (blogBot && t.userId === blogBot.id) || (t.tags || []).includes('博客同步') || t.prefix === '博客';
+        if (isBlogSync) { t.boardId = blogBoard.id; moved++; }
+      }
+      if (moved > 0) {
+        const recount = {};
+        db.topics.forEach(t => { recount[t.boardId] = (recount[t.boardId] || 0) + 1; });
+        db.boards.forEach(b => { b.topicCount = recount[b.id] || 0; });
+      }
+      if (moved > 0 || !db.blogBoardConsolidateV1) {
+        db.blogBoardConsolidateV1 = { at: nowIso(), boardId: blogBoard.id, moved, totalMoved: ((db.blogBoardConsolidateV1 && db.blogBoardConsolidateV1.totalMoved) || 0) + moved };
+      }
+    }
+  }
+  /* 🎯 WantAnswer 首搬分板纠正（一次性，2026-10-09 用户定）：两篇被通用分类关键词误分的搬运帖改归「日常」。
+     mid 7659 职业/复利迷茫帖（正文「健身爱好」误入 sports）、mid 7672 杀猪盘经历帖（「判决」误入 news）。
+     按话题 id 精确命中并以来源频道+tgMid 双保险防串帖；只改 boardId，正文/评论/楼层分毫不动；
+     改后按真实话题数重算 日常/体育/新闻 三板 topicCount。 */
+  if (!db.wantAnswerReclassV1) {
+    const dailyBoard = (db.boards || []).find(b => b && b.slug === 'daily');
+    const moveSpecs = [
+      { id: 'tpmv0uualnh0qdnq', mid: 7659 },
+      { id: 'tpmv0uuardej7fhh', mid: 7672 },
+    ];
+    const reclassed = [];
+    if (dailyBoard) {
+      for (const spec of moveSpecs) {
+        const t = (db.topics || []).find(x => x && x.id === spec.id && x.tgMid === spec.mid && (x.tgChannel || '') === 'WantAnswer');
+        if (t && t.boardId !== dailyBoard.id) {
+          const fromBoard = (db.boards || []).find(b => b && b.id === t.boardId);
+          reclassed.push({ id: t.id, mid: spec.mid, from: fromBoard ? fromBoard.slug : t.boardId, to: 'daily' });
+          t.boardId = dailyBoard.id;
+        }
+      }
+      if (reclassed.length) {
+        const recount = {};
+        (db.topics || []).forEach(x => { if (x) recount[x.boardId] = (recount[x.boardId] || 0) + 1; });
+        for (const slug of ['daily', 'sports', 'news']) {
+          const b = (db.boards || []).find(x => x && x.slug === slug);
+          if (b) b.topicCount = recount[b.id] || 0;
+        }
+      }
+    }
+    db.wantAnswerReclassV1 = { at: nowIso(), moved: reclassed };
+  }
 }
 function slugify(str) { return String(str).toLowerCase().replace(/[^\w\u4e00-\u9fa5]+/g, '-').replace(/^-|-$/g, '').slice(0, 80) || 'post'; }
 /* slug 全库唯一：同名标题（含电报同步的服务消息）不得共用一个链接，否则后一篇会被前一篇挡住打不开 */
@@ -585,12 +952,12 @@ function boot() {
         console.error('KV load failed at boot: serving seed data in-memory only, writes to KV are blocked');
         cacheDb = emptyDb();
       }
-      const bootSig = [cacheDb.topics.length, cacheDb.boards.length, cacheDb.users.length, Object.keys(cacheDb.companyReviews || {}).length, (cacheDb.extraCompanies || []).length].join('/');
+      const bootSig = [cacheDb.topics.length, cacheDb.boards.length, cacheDb.users.length, Object.keys(cacheDb.companyReviews || {}).length, (cacheDb.extraCompanies || []).length, cacheDb.welcomeHelperPingV1 ? 1 : 0].join('/');
       seed(cacheDb);
       migrate(cacheDb);
       /* 冷启动优化：seed/migrate 没实际改动时不再整库回写（旧逻辑每次冷启动都把全库
          下载→解析→再整库上传一遍，首击多等数秒）；签名变了才落盘持久化迁移结果 */
-      const sigAfter = [cacheDb.topics.length, cacheDb.boards.length, cacheDb.users.length, Object.keys(cacheDb.companyReviews || {}).length, (cacheDb.extraCompanies || []).length].join('/');
+      const sigAfter = [cacheDb.topics.length, cacheDb.boards.length, cacheDb.users.length, Object.keys(cacheDb.companyReviews || {}).length, (cacheDb.extraCompanies || []).length, cacheDb.welcomeHelperPingV1 ? 1 : 0].join('/');
       if (kvLoadedOk && sigAfter !== bootSig) await kvSet(cacheDb);
     } else {
       ensureDb();
@@ -792,6 +1159,8 @@ app.post('/api/auth/register', rlAuth, async (req, res) => {
   try {
     const { username, email, password, name, code } = req.body || {};
     if (!username || !email || !password) return res.status(400).json({ error: '缺少必填字段' });
+    /* 先回源对齐免码窗权威值：本实例快照可能是总控开窗前的，别拿旧状态判「需要注册码」 */
+    await refreshRegWindow(false, false);
     const db = loadDb();
     /* 人机验证：免码窗开启或同 IP 1 小时内无码尝试 ≥3 次时强制；带邀请码豁免。
        校验放在消耗邀请码之前，验证码不过不烧码；响应 needCaptcha 让前端动态显示验证码 */
@@ -807,6 +1176,11 @@ app.post('/api/auth/register', rlAuth, async (req, res) => {
     let rc = null;
     if (regCode) {
       rc = (db.regCodes || []).find(c => c.code.toUpperCase() === regCode);
+      if (!rc) {
+        /* 本实例码表可能滞后于总控新发的码：回源核心库同步一次再找 */
+        await refreshRegWindow(true, true);
+        rc = (db.regCodes || []).find(c => c.code.toUpperCase() === regCode);
+      }
       if (!rc) return res.status(400).json({ error: '邀请码无效，请检查后重试' });
       /* 兼容老单次码 + 新多次邀请码 */
       const maxUses = Math.max(1, rc.maxUses || 1);
@@ -852,6 +1226,31 @@ function regWindowState(db) {
   const until = (db.settings || {}).regOpenUntil || null;
   return { open: !!(until && Date.now() < new Date(until).getTime()), until };
 }
+/* 免码窗权威值（2026-10-09 修复「总控开了免费注册、注册时还要邀请码」）：窗口开关另存一个
+   小 KV key，只由 applyRegWindow 写，任何实例的整库回写都冲不掉它。注册/状态接口回源读它为准——
+   旧逻辑只读实例内存 cacheDb，暖实例的快照可能还是开窗前的，总控明明已开、用户却被判「需要注册码」。
+   小 key 不存在时（老数据）回退读核心库（不含话题，体积可控）并顺带同步注册码表。 */
+const REGWIN_KEY = DB_KEY + ':regwin';
+let regwinSyncAt = 0;
+async function refreshRegWindow(force, withCore) {
+  if (!IS_VERCEL || !cacheDb) return;
+  const now = Date.now();
+  if (!force && now - regwinSyncAt < 5000) return;
+  regwinSyncAt = now;
+  try {
+    cacheDb.settings = cacheDb.settings || {};
+    const w = await kvGetKey(KV_BASE, KV_TOKEN, REGWIN_KEY).catch(() => null);
+    const hasKey = !!(w && Object.prototype.hasOwnProperty.call(w, 'until'));
+    if (hasKey) cacheDb.settings.regOpenUntil = w.until || null;
+    if (!hasKey || withCore) {
+      const core = await kvGetKey(KV_BASE, KV_TOKEN, DB_KEY).catch(() => null);
+      if (core) {
+        if (!hasKey && core.settings) cacheDb.settings = { ...cacheDb.settings, ...core.settings };
+        if (Array.isArray(core.regCodes)) cacheDb.regCodes = core.regCodes;
+      }
+    }
+  } catch (e) { /* 刷新失败就用现有快照继续 */ }
+}
 async function applyRegWindow(body) {
   const db = loadDb();
   db.settings = db.settings || {};
@@ -862,9 +1261,15 @@ async function applyRegWindow(body) {
   }
   saveDb(db);
   await flushNow();
+  /* 整库落盘之外再写一份权威小 key（见 refreshRegWindow 注释），防旧实例整库回写把窗口冲掉 */
+  if (IS_VERCEL) {
+    try { await kvSetKey(KV_BASE, KV_TOKEN, REGWIN_KEY, { until: db.settings.regOpenUntil || null }); }
+    catch (e) { console.error('regwin key set failed:', e.message); }
+    regwinSyncAt = Date.now();
+  }
   return regWindowState(db);
 }
-app.get('/api/admin/reg-window', requireAdmin, (req, res) => { res.json(regWindowState(loadDb())); });
+app.get('/api/admin/reg-window', requireAdmin, async (req, res) => { await refreshRegWindow(false, false); res.json(regWindowState(loadDb())); });
 app.post('/api/admin/reg-window', requireAdmin, async (req, res) => {
   try { res.json(await applyRegWindow(req.body || {})); }
   catch (e) { res.status(500).json({ error: '设置失败：' + e.message }); }
@@ -1089,7 +1494,7 @@ app.post('/api/auth/reset-password', rlAuth, async (req, res) => {
 });
 
 /* ---- 注册图形验证码（自研 SVG，零依赖）：仅免码窗开启或同 IP 1 小时无码尝试 ≥3 次时强制，带邀请码豁免 ---- */
-const captchaStore = new Map();    // id -> { answer, expires }，内存即可（多实例下每实例独立，与现有内存限流同口径）
+const captchaStore = new Map();    // 旧版内存验证码（仅部署切换在途旧码的兜底校验；新码走无状态签名，见 newCaptcha）
 const regAttemptStore = new Map(); // ip -> [无码注册尝试时间戳]
 function clientIp(req) { return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '?'; }
 function captchaSvg(code) {
@@ -1111,16 +1516,34 @@ function newCaptcha() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去掉易混淆的 0/O/1/I
   let code = '';
   for (let i = 0; i < 4; i++) code += chars[crypto.randomInt(chars.length)];
-  const cid = 'c' + crypto.randomBytes(12).toString('hex');
-  captchaStore.set(cid, { answer: code, expires: Date.now() + 5 * 60 * 1000 });
-  if (captchaStore.size > 500) { const now = Date.now(); for (const [k, v] of captchaStore) if (v.expires <= now) captchaStore.delete(k); }
+  /* 无状态签名（2026-10-09 修复）：答案+过期时间 HMAC 签进 id，任何实例可验。
+     旧版只存实例内存 Map，Vercel 多实例下发码与验码常落不同实例，免码窗期间
+     无码注册总被判「验证码不正确或已过期」，用户只能改填邀请码绕行（免码窗等于没开）。 */
+  const payload = code + '.' + (Date.now() + 5 * 60 * 1000);
+  const sig = crypto.createHmac('sha256', COOKIE_SECRET).update('captcha:' + payload).digest('hex').slice(0, 32);
+  const cid = Buffer.from(payload, 'utf8').toString('base64url') + '.' + sig;
   return { id: cid, svg: captchaSvg(code) };
 }
-/* 一次性校验：无论答对答错，校验一次即失效，必须刷新 */
+/* 校验：签名验证码任何实例可验；签名不匹配时回退旧内存 Map（部署切换瞬间在途的旧码）。
+   内存路径保持一次性：无论答对答错，校验一次即失效，必须刷新 */
 function checkCaptcha(cid, answer) {
   if (!cid) return false;
-  const rec = captchaStore.get(cid);
-  captchaStore.delete(cid);
+  const raw = String(cid);
+  const dot = raw.lastIndexOf('.');
+  if (dot > 0) {
+    try {
+      const payload = Buffer.from(raw.slice(0, dot), 'base64url').toString('utf8');
+      const sig = raw.slice(dot + 1);
+      const expect = crypto.createHmac('sha256', COOKIE_SECRET).update('captcha:' + payload).digest('hex').slice(0, 32);
+      const a = Buffer.from(sig), b = Buffer.from(expect);
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        const [code, expStr] = payload.split('.');
+        return Date.now() <= Number(expStr) && String(answer || '').trim().toUpperCase() === String(code || '').toUpperCase();
+      }
+    } catch (e) { /* 落到下面的旧内存校验 */ }
+  }
+  const rec = captchaStore.get(raw);
+  captchaStore.delete(raw);
   if (!rec || rec.expires <= Date.now()) return false;
   return String(answer || '').trim().toUpperCase() === rec.answer;
 }
@@ -1141,7 +1564,8 @@ app.get('/api/auth/captcha', (req, res) => {
   const c = newCaptcha();
   res.json({ id: c.id, svg: c.svg });
 });
-app.get('/api/auth/reg-status', (req, res) => {
+app.get('/api/auth/reg-status', async (req, res) => {
+  await refreshRegWindow(false, false);
   const db = loadDb();
   res.json({ ...regWindowState(db), captchaRequired: regNeedCaptcha(db, req, false) });
 });
@@ -1260,8 +1684,11 @@ app.get('/api/hot24', (req, res) => {
   const db = loadDb();
   const days = Math.max(1, Math.min(30, parseInt(req.query.days) || 1));
   const since = Date.now() - days * 24 * 3600000;
+  const blogBoard = db.boards.find(b => b.slug === 'blog');
   const hot = db.topics
     .filter(t => (!t.status || t.status === 'published') && new Date(t.bumpedAt || t.createdAt).getTime() > since)
+    /* 同步动态板帖不进热文榜（首页侧栏与热点页同源，2026-10-09 与首页聚合流同口径排除） */
+    .filter(t => !blogBoard || t.boardId !== blogBoard.id)
     .map(t => ({ t, score: (t.likeCount || 0) * 3 + (t.replyCount || 0) * 2 + (t.viewCount || 0) * 0.1 + (t.favoriteCount || 0) * 2 }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 30)
@@ -1280,6 +1707,13 @@ app.get('/api/topics', (req, res) => {
   /* 板块官方说明帖（boardSeed 标记）：是「板块说明书」，只在对应板块页出现；
      首页/关注/标签/推荐等聚合流一律排除（搜索 /api/search 保留）。过滤在分页之前，total 口径一致 */
   if (!board) topics = topics.filter(t => !t.boardSeed);
+  /* 同步动态板（slug=blog，博客/聊天动态自动同步区）：同 boardSeed 口径——只在板块页出现，
+     无 board 参数的聚合流（首页最新/热门/推荐/关注/标签）一律排除；板块页、帖子详情、
+     搜索 /api/search 不受影响（2026-10-09 用户定：博客同步内容全部归同步动态、不要在首页） */
+  if (!board) {
+    const blogBoard = db.boards.find(b => b.slug === 'blog');
+    if (blogBoard) topics = topics.filter(t => t.boardId !== blogBoard.id);
+  }
   if (following) {
     if (!req.user) topics = [];
     else { const f = new Set(req.user.following || []); topics = topics.filter(t => f.has(t.userId)); }
@@ -1553,10 +1987,10 @@ app.post('/api/integrations/moments', async (req, res) => {
     board = db.boards.find(b => b.slug === wantedSlug) || null;
   }
   if (!board) {
-    board = db.boards.find(b => b.slug === 'moments');
+    board = db.boards.find(b => b.slug === 'blog');
   }
   if (!board) {
-    board = { id: id('b'), name: '聊天动态', slug: 'moments', color: '#2fa39b', description: '马老师专属聊天里发布的动态，自动同步到这里', topicCount: 0 };
+    board = { id: id('b'), name: '同步动态', slug: 'blog', color: '#3b82f6', description: '博客与聊天动态自动同步', topicCount: 0 };
     db.boards.push(board);
   }
   let bot = db.users.find(u => u.username === 'momentsbot');
@@ -3189,9 +3623,12 @@ async function collectDbStats(forceSnap) {
     catch (e) { out.push({ name: 'square-ant', label: '论坛分片 square-ant（话题B）', ok: false, error: String(e.message || e).slice(0, 80) }); }
   }
   const registry = upmonRegistry();
-  for (const d of registry) {
-    try { out.push({ name: d.name, label: d.label || d.name, account: d.account || '', region: d.region || '', purpose: d.purpose || '', ok: true, ...(await kvInfo(d.endpoint, d.token)) }); }
-    catch (e) { out.push({ name: d.name, label: d.label || d.name, account: d.account || '', region: d.region || '', purpose: d.purpose || '', ok: false, error: String(e.message || e).slice(0, 80) }); }
+  for (let _bi = 0; _bi < registry.length; _bi += 8) {
+    const _rs = await Promise.all(registry.slice(_bi, _bi + 8).map(async d => {
+      try { return { name: d.name, label: d.label || d.name, account: d.account || '', region: d.region || '', purpose: d.purpose || '', ok: true, ...(await kvInfo(d.endpoint, d.token)) }; }
+      catch (e) { return { name: d.name, label: d.label || d.name, account: d.account || '', region: d.region || '', purpose: d.purpose || '', ok: false, error: String(e.message || e).slice(0, 80) }; }
+    }));
+    out.push(..._rs);
   }
   let history = [];
   let creds = [];
@@ -3934,6 +4371,100 @@ app.get('/api/cron/blog-sync', async (req, res) => {
   res.json({ ok: true, synced });
 });
 
+/* 资讯类源频道逐帖自动归类（2026-10-08 用户定：每条帖自动识别放合适板块）。
+   关键词按全文子串匹配（英文转小写），数组顺序即优先级：垂直意图（失业/交易/吃瓜/测评）
+   在前，其次技术，政策财经社会硬新闻进新闻板；短英文词走词边界正则防误伤（如 ai）。
+   体育复用体育分类器；都不命中返回 ''，调用方落「日常」板。树洞板不参与归类（投稿专用）。 */
+const TG_BOARD_RULES = [
+  ['unemployment', ['失业', '裁员', '被裁', '求职', '找工作', '招聘', '面试', '简历', '离职', '被优化', '就业难', '劳动者']],
+  ['trade', ['出售', '求购', '转让', '二手', '闲置', '补货', '特价', '促销', '优惠券', '领券', '续费优惠', '骨折价', '清仓']],
+  ['chigua', ['争议', '翻车', '爆料', '八卦', '塌房', '出轨', '热搜', '被曝', '偷拍', '人设崩']],
+  ['review', ['测评', '评测', '实测', '跑分', '体验报告', '上手体验', '深度评测', '对比测试', '开箱']],
+  ['tech', ['人工智能', '大模型', '语言模型', '芯片', '半导体', '英伟达', '黄仁勋', '服务器', '数据中心', '云服务', '云计算', '开源', '黑客', '漏洞', '网络安全', '恶意软件', '操作系统', '显卡', '处理器', '智能手机', '笔记本', '电动车', '电动汽车', '自动驾驶', '机器人', '卫星', '星链', '频谱', 'chatgpt', 'openai', 'anthropic', 'claude', 'deepseek', 'gemini', 'iphone', '微软', '谷歌', '三星', '华为', '小米', '特斯拉', '马斯克', 'spacex', '字节跳动', '阿里巴巴', '腾讯', '苹果', 'app store']],
+  ['news', ['关税', '制裁', '选举', '投票', '表决', '外交', '军事', '导弹', '战机', '法院', '判决', '诉讼', '起诉', '总统', '首相', '央行', '加息', '降息', '股市', '股指', '期货', '油价', '房贷', '通胀', '财政', '罚款', '事故', '空难', '火灾', '地震', '袭击', '内幕交易']],
+];
+const TG_BOARD_EN_RE = /\b(ai|gpt|llm|gpu|cpu|api|ios|android|windows|linux|vps|dns|ssl|github|5g)\b/;
+function classifyTgPostBoard(text) {
+  const raw = String(text || '');
+  if (!raw.trim()) return '';
+  /* 只看正文不看链接：链接里的英文子串会误伤子串关键词（路透链接 testing 撞电竞 tes 实测踩过） */
+  const prose = raw.replace(/https?:\/\/[^\s)）」』】>]+/g, ' ');
+  /* 体育只认真标题区（首行）：体育短词（tes/atp 之类三字母）出现在正文英文里太容易误伤 */
+  const headline = prose.split('\n')[0].slice(0, 60);
+  if (classifySportTitle(headline)) return 'sports';
+  const lower = prose.toLowerCase();
+  if (SPORT_GENERIC_KEYWORDS.some(k => lower.includes(k))) return 'sports';
+  /* 标题区优先（2026-10-08）：正文里一笔带过的词不该压过标题主题——苹果商业新闻只因
+     正文提了句高管「离职」被拖进失业板的实测教训。标题命中哪个板就进哪个；标题没命中
+     才轮到全文关键词（行为与从前兼容，标题空泛的老帖不受影响）。 */
+  const headlineLower = headline.toLowerCase();
+  for (const [slug, kws] of TG_BOARD_RULES) if (kws.some(k => headlineLower.includes(k))) return slug;
+  for (const [slug, kws] of TG_BOARD_RULES) if (kws.some(k => lower.includes(k))) return slug;
+  if (TG_BOARD_EN_RE.test(lower)) return 'tech';
+  return '';
+}
+/* 资讯去重（2026-10-08 用户定：重复新闻不要发）：标题归一化（剥链接、去标点空白、转小写，
+   只留文字与数字）后与论坛近 14 天已发帖标题比对——包含 / 二元组相似≥0.78 / 最长公共子串≥10 字
+   任一命中才判重复。阈值刻意保守：只拦标题近乎雷同的，改写过的同题新闻照常搬，避免误杀。
+   只作用于 classify 归类频道（importOne 里按 opts.classify 触发），树洞系频道不受影响。 */
+const normNewsTitle = (s) => String(s || '')
+  .replace(/https?:\/\/[^\s)）」』】>]+/g, ' ')
+  .toLowerCase()
+  .replace(/[^a-z0-9\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+/g, '');
+const newsTitleSimilarity = (a, b) => {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const grams = (x) => { const set = new Set(); for (let i = 0; i + 1 < x.length; i++) set.add(x.slice(i, i + 2)); return set; };
+  const A = grams(a), B = grams(b);
+  if (!A.size || !B.size) return 0;
+  let hit = 0;
+  for (const g of A) if (B.has(g)) hit++;
+  return hit / (A.size + B.size - hit);
+};
+const newsTitleCommonRun = (a, b) => {
+  /* 最长公共子串长度（标题都很短，直接 DP） */
+  if (!a || !b) return 0;
+  let best = 0;
+  const dp = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1] ? prev + 1 : 0;
+      if (dp[j] > best) best = dp[j];
+      prev = tmp;
+    }
+  }
+  return best;
+};
+function findNewsDuplicate(db, text) {
+  const raw = String(text || '').replace(/https?:\/\/[^\s)）」』】>]+/g, ' ');
+  const headLine = raw.split('\n').map(x => x.trim()).filter(Boolean)[0] || '';
+  const head = normNewsTitle(headLine);
+  if (head.length < 8) return null;
+  const since = Date.now() - 14 * 24 * 3600 * 1000;
+  for (const t of db.topics) {
+    if (!t || !t.title) continue;
+    if ((t.status || 'published') !== 'published') continue;
+    const ct = new Date(t.createdAt).getTime();
+    if (isNaN(ct) || ct < since) continue;
+    const cand = normNewsTitle(t.title);
+    if (cand.length < 8) continue;
+    if (head.includes(cand) || cand.includes(head)) return t.title;
+    if (Math.min(head.length, cand.length) >= 10 && newsTitleSimilarity(head, cand) >= 0.78) return t.title;
+    if (newsTitleCommonRun(head, cand) >= 10) return t.title;
+  }
+  return null;
+}
+/* 注册参数 sinceTs 归一：毫秒数或 ISO 时间串 → 毫秒时间戳，非法/未给为 0（不截断） */
+const parseSinceTs = (v) => {
+  if (v === undefined || v === null || v === '') return 0;
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  const t = new Date(String(v)).getTime();
+  return Number.isFinite(t) && t > 0 ? t : 0;
+};
+
 /* 额外 TG 频道整体迁移注册（如忏悔室）：登记后由 /api/cron/tg-sync 每轮自动搬（新帖+全部历史+评论），
    带自定义标签与匿名标注。鉴权：TG_SYNC_SECRET / TG_SUBMIT_SECRET / 论坛管理员会话 */
 app.post('/api/integrations/tg-migrate', async (req, res) => {
@@ -3966,12 +4497,17 @@ app.post('/api/integrations/tg-migrate', async (req, res) => {
     db.tgMigrations[migChannel] = {
       tag: String(body.tag || '').slice(0, 20),
       anonymous: !!body.anonymous,
+      /* classify：逐帖关键词归类到各板块（资讯频道用）；sinceTs：只搬该时间点之后的帖（只回填今天用） */
+      classify: !!body.classify,
+      sinceTs: parseSinceTs(body.sinceTs),
       lastId: initLast, oldestId: initOldest, done: !!mids.length && initOldest <= 1, emptyHits: 0,
       registeredAt: nowIso(),
     };
   } else {
     if (body.tag !== undefined) existing.tag = String(body.tag || '').slice(0, 20);
     if (body.anonymous !== undefined) existing.anonymous = !!body.anonymous;
+    if (body.classify !== undefined) existing.classify = !!body.classify;
+    if (body.sinceTs !== undefined) existing.sinceTs = parseSinceTs(body.sinceTs);
     if (body.resume) { existing.done = false; existing.emptyHits = 0; }
     /* 进度覆盖（补搬缺口用）：把 oldestId 拨回缺口上方并置 done=false，同步轮次会向下逐页补齐 */
     if (Number.isFinite(body.oldestId) && body.oldestId > 1) existing.oldestId = Math.floor(body.oldestId);
@@ -4059,6 +4595,17 @@ app.get('/api/integrations/backup', async (req, res) => {
 
 /* 🌳 TG 频道自动搬运：定时抓 t.me/s/<频道> 公开页，新帖由「树洞搬运」发到「电报树洞」板块（广告过滤，TG_SYNC_SECRET 鉴权） */
 const TG_AD_RE = /广告|推广|赞助|商务合作|招商|代理加盟|开户|充值返|博彩|赌场|下注|稳赚|副业项目|兼职招聘|日入|月入过万|加群|进群|入群|群推荐|频道推荐|优质频道|旗下频道|互推|资源群|福利群|点击链接|立即购买|购买链接|限时优惠|秒杀价|官网直达|客服微信|联系微信|扫码进|欢迎关注|点击下方|点此进入|➡|t\.me\/\+|telegram\.me\/\+/i;
+/* 评论区推广按钮式广告补充识别（2026-10-09 用户定）：只作用于评论镜像，不碰正文帖过滤，
+   词面取自真实样本（跨境信用卡/DeppNude 一键脱衣/印度药徒代购/白鲸加速器免费 VPN），
+   均为正文讨论里几乎不会出现的完整广告短语，避免错杀正常问答帖。 */
+const TG_COMMENT_AD_RE = /跨境信用卡|0月费|DeppNude|一键脱衣|视频换脸|印度药徒|白鲸加速器|免费VPN|免费加速器/i;
+/* 群管理机器人识别（2026-10-09 用户定）：讨论群机器人 nmBot 的发言（欢迎语/引流/自动回复）
+   一律不镜像进论坛评论区。按评论显示名/handle 归一后精确匹配——真实样本显示名恒为「nmBot」、
+   handle 为空，故精确匹配不会误伤同名真人以外的任何评论者。 */
+const isNmBotComment = (c) => {
+  const norm = (v) => String(v || '').trim().toLowerCase();
+  return norm(c && c.author) === 'nmbot' || norm(c && c.handle) === 'nmbot';
+};
 /* 电报链接剥离（用户定：搬运内容里 t.me/telegram.me 链接一律过滤） */
 const stripTgLinks = (s) => String(s || '')
   .replace(/\[([^\]]*)\]\((?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)\/[^)]+\)/gi, '$1')
@@ -4066,6 +4613,78 @@ const stripTgLinks = (s) => String(s || '')
   .replace(/[ \t]{2,}/g, ' ')
   .replace(/\n{3,}/g, '\n\n')
   .trim();
+
+/* 源频道签名尾巴识别（2026-10-09 用户定）：搬运帖末尾残留的源频道宣传签名，
+   如「🌸 科技圈 ()· 茶馆 () · 投稿 ()」——t.me 链接被剥掉后剩下的空括号分段宣传。
+   保守口径（宁可漏删不可错杀）：候选段只能由推广词（科技圈/茶馆/投稿/频道/收藏/
+   关注/订阅/点击投稿/收藏频道）+ 空括号 + 分隔符 + emoji 构成，去掉推广词后残余
+   ≤2 字、至少 2 个推广词、且不带句读（。！？）才认定为签名；长句、正常结尾一律不动。 */
+function sigSkeleton(seg) {
+  return String(seg || '')
+    .replace(/[（(]\s*[)）]/g, '')
+    .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{2060}-\u{2064}]/gu, '')
+    .replace(/[·•・｜|/、,，;；:：~～\-—–_\s]/g, '');
+}
+const SIG_PROMO_RE = /科技圈|茶馆|点击投稿|收藏频道|投稿|频道|收藏|关注|订阅/g;
+function isPurePromoSeg(seg) {
+  const s = String(seg || '').trim();
+  if (!s || s.length > 60) return false;
+  if (/[。！？]/.test(s)) return false;
+  const skel = sigSkeleton(s);
+  if (!skel || skel.length > 30) return false;
+  if ((skel.match(SIG_PROMO_RE) || []).length < 2) return false;
+  return skel.replace(SIG_PROMO_RE, '').length <= 2;
+}
+function isSigTailLine(line) {
+  const l = String(line || '').trim();
+  if (!l) return false;
+  const groups = (l.match(/[（(]\s*[)）]/g) || []).length;
+  const emojiLed = /^\s*(🌸|📭|💦)/.test(l);
+  return isPurePromoSeg(l) && (groups >= 2 || emojiLed);
+}
+/* 签名与正文同行时（如新闻帖尾部「…正文。 🌸 科技圈· 茶馆 · 投稿」）：
+   只从最后一个 🌸/📭/💦 起、且其后是纯推广段才下刀，正文部分分毫不动 */
+function cutInlineSigSuffix(line) {
+  const s = String(line || '');
+  const re = /(🌸|📭|💦)/g; let m; const pos = [];
+  while ((m = re.exec(s))) pos.push(m.index);
+  for (let i = pos.length - 1; i >= 0; i--) {
+    const seg = s.slice(pos[i]);
+    if (isPurePromoSeg(seg)) {
+      const head = s.slice(0, pos[i]).replace(/[·•・｜|/、\s]+$/, '');
+      if (head.trim().length >= 4) return head;
+    }
+  }
+  return null;
+}
+/* 清理正文末尾的源频道签名（独行签名 + 行内尾缀，末尾图片行先摘开再装回）；
+   没命中原样返回；整帖只剩签名时不下刀，避免把正文清空 */
+function stripSourceSignature(content) {
+  let s = String(content || '');
+  const orig = s;
+  let imgLines = [];
+  {
+    const lines = s.split('\n');
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    while (lines.length && /^!\[[^\]]*\]\([^)]*\)$/.test(lines[lines.length - 1].trim())) imgLines.unshift(lines.pop());
+    s = lines.join('\n');
+  }
+  let changed = false;
+  for (let k = 0; k < 3; k++) {
+    const lines = s.split('\n');
+    let idx = lines.length - 1;
+    while (idx >= 0 && !lines[idx].trim()) idx--;
+    if (idx < 0) break;
+    if (isSigTailLine(lines[idx])) { lines.splice(idx, 1); s = lines.join('\n'); changed = true; continue; }
+    const cut = cutInlineSigSuffix(lines[idx]);
+    if (cut !== null) { lines[idx] = cut; s = lines.join('\n'); changed = true; continue; }
+    break;
+  }
+  if (!changed) return orig;
+  const cleaned = s.replace(/\n{3,}/g, '\n\n').trim();
+  if (!cleaned) return orig;
+  return imgLines.length ? cleaned + '\n\n' + imgLines.join('\n') : cleaned;
+}
 
 function tgStripHtml(html) {
   return String(html || '')
@@ -4102,6 +4721,72 @@ app.get('/api/cron/tg-sync', async (req, res) => {
       }
     }
     db.viewOriginalStrippedV1 = { at: nowIso(), posts: strippedPosts };
+  }
+  /* 🧹 源频道签名尾巴存量清理（2026-10-09 用户定）：回扫全部话题的正文与评论，
+     用与搬运同一把尺子（stripSourceSignature）删掉末尾残留的频道宣传签名（如
+     「🌸 科技圈 ()· 茶馆 () · 投稿 ()」）；规则保守，带句读的正常结尾零误伤，只跑一次。
+     落点在 tg-sync 处理器内（回源刷新之后、落盘之前），与 viewOriginalStrippedV1 同口径，
+     避免 boot migrate 的内容改动被 KV 回源刷新冲掉。 */
+  if (!db.sourceSignatureStripV1) {
+    let cleanedPosts = 0, cleanedTopics = 0;
+    for (const t of db.topics) {
+      let tChanged = false;
+      for (const p of (t.posts || [])) {
+        if (!p || typeof p.content !== 'string' || !p.content) continue;
+        const nc = stripSourceSignature(p.content);
+        if (nc !== p.content) { p.content = nc; cleanedPosts++; tChanged = true; }
+      }
+      if (tChanged) cleanedTopics++;
+    }
+    db.sourceSignatureStripV1 = { at: nowIso(), posts: cleanedPosts, topics: cleanedTopics };
+  }
+  /* 🧹 nmBot 机器人评论存量清理（2026-10-09 用户定）：讨论群机器人 nmBot 的存量评论
+     （欢迎语/引流/自动回复，样本 62 条，多来自忏悔室与树洞讨论群）整条移除，重排楼层号并
+     按真实楼层重算 replyCount；首楼永不动。落点同 sourceSignatureStripV1，只跑一次。
+     移除的评论其 tgCid 仍留在 tgCommentIds 里不会被重新抓回，且导入侧已加同名拦截。 */
+  if (!db.nmBotCommentStripV1) {
+    let removedComments = 0, touchedTopics = 0;
+    for (const t of db.topics) {
+      if (!Array.isArray(t.posts) || t.posts.length < 2) continue;
+      const before = t.posts.length;
+      t.posts = t.posts.filter((p, i) => {
+        if (i === 0 || !p) return true;
+        const an = String(p.authorName || '').trim().toLowerCase();
+        const ah = String(p.authorHandle || '').trim().toLowerCase();
+        return an !== 'nmbot' && ah !== 'nmbot';
+      });
+      if (t.posts.length !== before) {
+        removedComments += before - t.posts.length;
+        touchedTopics++;
+        t.posts.forEach((p, i) => { p.postNumber = i + 1; });
+        t.replyCount = t.posts.length - 1;
+      }
+    }
+    db.nmBotCommentStripV1 = { at: nowIso(), removed: removedComments, topics: touchedTopics };
+  }
+  /* 🧮 板块话题计数对账（2026-10-09）：个别板块 topicCount 与真实话题数存在漂移
+     （tech 存量多报 4，与本次改动无关），按每块真实话题数重算，只跑一次。 */
+  if (!db.topicCountRecountV1) {
+    let fixedBoards = 0;
+    const realCounts = {};
+    for (const t of db.topics) realCounts[t.boardId] = (realCounts[t.boardId] || 0) + 1;
+    for (const b of db.boards) {
+      const r = realCounts[b.id] || 0;
+      if ((b.topicCount || 0) !== r) { b.topicCount = r; fixedBoards++; }
+    }
+    db.topicCountRecountV1 = { at: nowIso(), fixedBoards };
+  }
+  /* 评论漏抓一次性回补（2026-10-09）：chxpd 搬移帖「租房邻居」(tpmuzkguqpalxvkm) 首轮镜像时
+     TG 只有 4 条评论就被标完成，之后新增的 41 条因刷新名额长期被高 mid 频道帖占满而从未补抓。
+     把该帖打回重抓队列，配合新的逐窗下行抓取补齐缺口；已有评论按 tgCid 去重，不会重复。 */
+  if (!db.tgCommentGapFixV1) {
+    let requeued = 0;
+    for (const t of db.topics) {
+      if (t.id === 'tpmuzkguqpalxvkm' && t.tgCommentsDone) {
+        t.tgCommentsDone = false; t.tgRequeue = true; t.tgCommentWalk = 0; requeued++;
+      }
+    }
+    db.tgCommentGapFixV1 = { at: nowIso(), requeued };
   }
   if (req.query.reset === '1') db.tgSyncState = { lastId: 0, oldestId: 0, done: false }; /* 重置基线：重新搬最近一批+重新回填 */
   /* 投稿机器人账号 */
@@ -4222,6 +4907,54 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     }
     db.tgLinkCleanV1 = { at: nowIso(), removed: rmPosts, stripped: strippedPosts };
   }
+  /* 一次性纠偏（2026-10-08）：归类频道首批导入里有个别资讯被误判板块（链接英文子串误伤分类器），
+     按修好的分类器对归类频道已导入帖重判，错板正位并同步板块计数，只跑一次 */
+  if (!db.tgClassifyFixV1) {
+    let fixed = 0;
+    const migChs = new Set(Object.entries(db.tgMigrations || {}).filter(([, m]) => m && m.classify).map(([ch]) => ch));
+    if (migChs.size) {
+      for (const t of db.topics) {
+        if (t.source !== 'import' || !migChs.has(t.tgChannel || '')) continue;
+        const text = String((((t.posts || [])[0] || {}).content) || t.title || '');
+        const slug = classifyTgPostBoard(text);
+        if (!slug) continue;
+        const nb = db.boards.find(b => b.slug === slug);
+        if (!nb || nb.id === t.boardId) continue;
+        const ob = db.boards.find(b => b.id === t.boardId);
+        if (ob) ob.topicCount = Math.max(0, (ob.topicCount || 0) - 1);
+        nb.topicCount = (nb.topicCount || 0) + 1;
+        t.boardId = nb.id;
+        t.prefix = nb.name;
+        if (Array.isArray(t.tags) && t.tags.length && ob && t.tags[0] === ob.name) t.tags[0] = nb.name;
+        fixed++;
+      }
+    }
+    db.tgClassifyFixV1 = { at: nowIso(), fixed };
+  }
+  /* 一次性纠偏 V2（2026-10-08）：分类器加了「标题区优先」与新词（苹果/劳动者）后，
+     对归类频道存量帖按新分类器重判一次，错板正位并同步计数（同 V1 模式，只跑一次） */
+  if (!db.tgClassifyFixV2) {
+    let fixed = 0;
+    const migChs = new Set(Object.entries(db.tgMigrations || {}).filter(([, m]) => m && m.classify).map(([ch]) => ch));
+    if (migChs.size) {
+      for (const t of db.topics) {
+        if (t.source !== 'import' || !migChs.has(t.tgChannel || '')) continue;
+        const text = String((((t.posts || [])[0] || {}).content) || t.title || '');
+        const slug = classifyTgPostBoard(text);
+        if (!slug) continue;
+        const nb = db.boards.find(b => b.slug === slug);
+        if (!nb || nb.id === t.boardId) continue;
+        const ob = db.boards.find(b => b.id === t.boardId);
+        if (ob) ob.topicCount = Math.max(0, (ob.topicCount || 0) - 1);
+        nb.topicCount = (nb.topicCount || 0) + 1;
+        t.boardId = nb.id;
+        t.prefix = nb.name;
+        if (Array.isArray(t.tags) && t.tags.length && ob && t.tags[0] === ob.name) t.tags[0] = nb.name;
+        fixed++;
+      }
+    }
+    db.tgClassifyFixV2 = { at: nowIso(), fixed };
+  }
   const TG_UA = { headers: { 'User-Agent': 'Mozilla/5.0 (JMForumTgSync/1.0)' } };
   const parsePosts = (pageHtml) => {
     const list = [];
@@ -4248,39 +4981,72 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   }
   state.channel = channel;
   let skippedAds = 0;
+  const newsDedupHits = []; /* 本轮资讯去重命中明细：被跳帖标题 + 命中的已有帖标题，随响应报出 */
+  const linkPostSkips = []; /* 本轮纯链接帖跳过明细，随响应报出 */
   const importOne = async (p, srcChannel = channel, opts = {}) => {
     if (!p.text && !p.image) return 'empty';
     if (TG_AD_RE.test(p.text)) { skippedAds++; return 'ad'; }
+    /* 日期截断（注册带 sinceTs 的频道，如只回填今天）：截断点之前的帖一律跳过，不补历史 */
+    if (opts.sinceTs && p.at) {
+      const pts = new Date(p.at).getTime();
+      if (!isNaN(pts) && pts < opts.sinceTs) return 'old';
+    }
+    /* 逐帖归类（classify 频道）：关键词命中哪个板块进哪个，命中不了落「日常」；
+       非归类频道（树洞系）一律进树洞板，行为与从前一致 */
+    let targetBoard = board;
+    let boardTag = '树洞';
+    if (opts.classify) {
+      const hitSlug = classifyTgPostBoard(p.text);
+      const hit = hitSlug ? db.boards.find(b => b.slug === hitSlug) : null;
+      const fallback = db.boards.find(b => b.slug === 'daily');
+      if (hit) { targetBoard = hit; boardTag = hit.name; }
+      else if (fallback) { targetBoard = fallback; boardTag = fallback.name; }
+    }
     /* 已搬过的自动跳过（按来源频道+编号判定，不同频道编号相同也不误伤），防重置/补齐时重复发帖 */
-    if (db.topics.some(t => t.boardId === board.id && t.userId === bot.id && t.slug && t.slug.endsWith('-' + p.mid) && ((t.tgChannel || '') === srcChannel || (t.tgFromChannel || '') === srcChannel))) return 'dup';
+    if (db.topics.some(t => t.boardId === targetBoard.id && t.userId === bot.id && t.slug && t.slug.endsWith('-' + p.mid) && ((t.tgChannel || '') === srcChannel || (t.tgFromChannel || '') === srcChannel))) return 'dup';
     if (db.topics.some(t => t.tgMid === p.mid && (t.tgChannel || 'chxpd') === srcChannel)) return 'dup';
+    /* 纯链接帖整帖不搬（归类频道，2026-10-08 用户定）：正文带链接、剥光全部链接后几乎没字、又没图 = 链接堆；
+       有图（媒体帖）或剥后还有正文的一律照常搬，宁可少拦 */
+    if (opts.classify && !p.image && /(https?:\/\/|t\.me\/|telegram\.me\/)/i.test(p.text)) {
+      const linkStripped = stripTgLinks(p.text).replace(/https?:\/\/[^\s)）」』】>]+/g, ' ').replace(/\s+/g, ' ').trim();
+      if (linkStripped.length <= 4) { linkPostSkips.push({ channel: srcChannel, mid: p.mid, text: String(p.text || '').replace(/\s+/g, ' ').slice(0, 60) }); return 'linkonly'; }
+    }
+    /* 资讯去重（归类频道，2026-10-08 用户定：重复新闻不要发）：同题新闻已在论坛（含别的频道刚搬的、
+       网友发的、本频道先前搬的），标题近乎雷同就不再发；判定见 findNewsDuplicate，保守阈值防误杀 */
+    if (opts.classify) {
+      const dupTitle = findNewsDuplicate(db, p.text);
+      if (dupTitle) { newsDedupHits.push({ channel: srcChannel, mid: p.mid, skipped: (String(p.text || '').split('\n').map(x => x.trim()).filter(Boolean)[0] || '').slice(0, 40), matched: dupTitle }); return 'newsdup'; }
+    }
     const time = p.at && !isNaN(new Date(p.at).getTime()) ? new Date(p.at).toISOString() : nowIso();
     const flat = p.text.replace(/\s+/g, ' ').trim();
     const title = flat ? flat.slice(0, 30) : '树洞图片投稿';
-    const cleanText = stripTgLinks(p.text); /* 电报链接过滤（用户定） */
+    const cleanText = stripSourceSignature(stripTgLinks(p.text)); /* 电报链接过滤 + 源频道签名尾巴过滤（用户定） */
     /* 搬移帖不加来源备注行（2026-10-04 用户定），正文就是原内容 */
     const body = cleanText + (p.image ? `\n\n![](${p.image})` : '');
     const topicId = id('tp');
-    const newTags = (Array.isArray(opts.tags) && opts.tags.length) ? opts.tags : ['树洞'];
+    const newTags = opts.classify
+      ? [boardTag, ...(opts.channelTag ? [opts.channelTag] : [])]
+      : ((Array.isArray(opts.tags) && opts.tags.length) ? opts.tags : ['树洞']);
     /* 标签登记进标签库，侧栏标签云/标签页才有入口（树洞/忏悔室等） */
     if (!Array.isArray(db.tags)) db.tags = [];
     for (const tgName of newTags) if (tgName && !db.tags.some(x => x.name === tgName)) db.tags.push({ id: id('t'), name: tgName });
     const importedTopic = {
-      id: topicId, title, slug: uniqueSlug(slugify(title), db.topics) + '-' + p.mid, boardId: board.id, userId: bot.id,
+      id: topicId, title, slug: uniqueSlug(slugify(title), db.topics) + '-' + p.mid, boardId: targetBoard.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
       tags: newTags, posts: [{ id: id('p'), topicId, userId: bot.id, content: body, createdAt: time, likeCount: 0, postNumber: 1 }],
       pinned: false, recommended: false, price: 0, closed: false,
       poll: null, bounty: 0, bestReplyId: null,
-      prefix: '树洞',
+      prefix: boardTag,
       tgMid: p.mid, tgChannel: srcChannel, tgCommentIds: [], tgCommentMin: 0, tgCommentsDone: false,
       ...(opts.anonymous ? { anonymous: true } : {}),
       ...(opts.source ? { source: opts.source } : {}),
     };
     db.topics.push(importedTopic);
-    board.topicCount = (board.topicCount || 0) + 1;
+    targetBoard.topicCount = (targetBoard.topicCount || 0) + 1;
     /* 导入即正式帖，与审核通过同一出口同步到聊天树洞频道（失败只记 chatSyncError 不拦导入）；
-       历史回填（opts.backfill）只进论坛不刷聊天，只同步守望/增量新帖 */
-    if (!opts.backfill) await syncTopicToChatTreehole(db, importedTopic);
+       历史回填（opts.backfill）只进论坛不刷聊天，只同步守望/增量新帖；
+       归类到其他板块的资讯帖不进聊天树洞频道（那边只收树洞内容，防资讯刷屏） */
+    if (!opts.backfill && targetBoard.id === board.id) await syncTopicToChatTreehole(db, importedTopic);
     return 'ok';
   };
   /* ① 最新一页 */
@@ -4368,7 +5134,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   const migReport = {};
   for (const [migChannel, mig] of Object.entries(db.tgMigrations)) {
     if (!mig) continue;
-    const migOpts = { tags: ['树洞', ...(mig.tag ? [mig.tag] : [])], anonymous: !!mig.anonymous, source: 'import' };
+    const migOpts = { tags: ['树洞', ...(mig.tag ? [mig.tag] : [])], anonymous: !!mig.anonymous, source: 'import', classify: !!mig.classify, sinceTs: mig.sinceTs || 0, channelTag: mig.tag || '' };
     try {
       const rm = await fetch(`https://t.me/s/${migChannel}`, TG_UA);
       if (rm.ok) {
@@ -4404,6 +5170,8 @@ app.get('/api/cron/tg-sync', async (req, res) => {
         mig.emptyHits = 0;
         const pageMin = older[0].mid;
         if (pageMin >= mig.oldestId) break;
+        /* 带 sinceTs 的频道：整页都早于截断点 = 截断日已搬完，直接收尾进守望，不再往回空翻历史 */
+        if (mig.sinceTs && older.every(x => { const xt = x.at ? new Date(x.at).getTime() : NaN; return !isNaN(xt) && xt < mig.sinceTs; })) { mig.oldestId = pageMin; mig.done = true; break; }
         for (const p of older) {
           if (p.mid >= mig.oldestId) continue;
           if (await importOne(p, migChannel, { ...migOpts, backfill: true }) === 'ok') migrated++;
@@ -4437,10 +5205,15 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     return out;
   };
   let commentsAdded = 0;
+  let botCommentsSkipped = 0;   /* nmBot 机器人评论跳过数（本轮全部频道合计） */
+  let commentAdsSkipped = 0;    /* 推广按钮式广告评论跳过数 */
   let commentTopics = 0;
   const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
+  const migChannelSet = new Set(Object.keys(db.tgMigrations || {}));
   const allMine = db.topics
-    .filter(t => t.boardId === board.id && (t.userId === bot.id || (typeof t.tgMid === 'number' && t.tgChannel === channel)))
+    .filter(t => (t.boardId === board.id && (t.userId === bot.id || (typeof t.tgMid === 'number' && t.tgChannel === channel)))
+      /* 归类到其他板块的注册频道帖也要镜像评论：按来源频道认，不绑树洞板 */
+      || (t.userId === bot.id && typeof t.tgMid === 'number' && !!t.tgChannel && migChannelSet.has(t.tgChannel)))
     .map(t => {
       if (typeof t.tgMid !== 'number') {
         const mm = /-(\d+)$/.exec(t.slug || '');
@@ -4451,39 +5224,70 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     })
     .filter(t => t.tgMid > 0);
   /* 未补完评论的按最近活跃优先（用户先看到的帖先补齐），而不是只按入库顺序 */
-  const ctCandidates = allMine.filter(t => !t.tgCommentsDone).sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt)).slice(0, 16); /* 未完成评论同步的 16 帖 */
-  const ctRefresh = allMine.filter(t => t.tgCommentsDone && new Date(t.createdAt).getTime() > weekAgo).sort((a, b) => b.tgMid - a.tgMid).slice(0, 3); /* 近 7 天已同步完的帖再查最新页，接新评论 */
-  for (const [t, maxPages] of [...ctCandidates.map(t => [t, 3]), ...ctRefresh.map(t => [t, 1])]) {
+  /* 选题（2026-10-09 漏抓修复）：旧逻辑两坑——①已同步帖只按 tgMid 取前 3 名刷新，
+     各频道 mid 数值不可比，热门频道新帖长期霸榜，低 mid 帖的新评论永远轮不到；
+     ②抓取时从最新页直接跳到 tgCommentMin，中间整段窗口被跳过，落后超过一窗就永久留洞。
+     改法：刷新按「最久未检查」轮转；抓取逐窗向老走、不许跳段；预算耗尽把下行前沿
+     存 tgCommentWalk 下轮续传；只有接上历史最老前沿或翻到最老一条才算完成。 */
+  const ctRequeue = allMine.filter(t => t.tgRequeue);
+  const ctCandidates = allMine.filter(t => !t.tgCommentsDone && !t.tgRequeue)
+    .sort((a, b) => new Date(b.bumpedAt) - new Date(a.bumpedAt)).slice(0, 12); /* 未完成评论同步的帖 */
+  const monthAgo = Date.now() - 30 * 24 * 3600 * 1000;
+  const ctRefresh = allMine.filter(t => t.tgCommentsDone && new Date(t.createdAt).getTime() > monthAgo)
+    .sort((a, b) => (a.tgCommentCheckedAt || 0) - (b.tgCommentCheckedAt || 0)).slice(0, 8); /* 30 天内已同步帖轮转复查新评论 */
+  /* 热帖快车道（2026-10-11 用户定：随时监控新帖+最新评论）：48 小时内建的帖每轮优先查新评论，
+     最久未检查的 6 帖 × 2 页，只盯最新窗口，保证热帖新评论 20 分钟内进论坛 */
+  const twoDaysAgo = Date.now() - 48 * 3600 * 1000;
+  const ctHot = allMine.filter(t => new Date(t.createdAt).getTime() > twoDaysAgo)
+    .sort((a, b) => (a.tgCommentCheckedAt || 0) - (b.tgCommentCheckedAt || 0)).slice(0, 6);
+  const ctHotIds = new Set(ctHot.map(t => t.id));
+  for (const [t, maxPages] of [...ctRequeue.map(t => [t, 12]), ...ctCandidates.map(t => [t, 4]), ...ctHot.map(t => [t, 2]), ...ctRefresh.filter(t => !ctHotIds.has(t.id)).map(t => [t, 4])]) {
     const seen = new Set(t.tgCommentIds || []);
     const fresh = [];
-    let minSeen = t.tgCommentMin || Infinity;
+    const wasDone = !!t.tgCommentsDone;
+    const frontier0 = t.tgCommentMin || 0;      /* 历史已抓到的最老评论 ID（0=还没抓过） */
+    const startMax = seen.size ? Math.max(...seen) : 0;
+    let minSeen = frontier0 || Infinity;
+    let walkMin = Infinity;                     /* 本轮下行到的最老窗口底 */
     let pages = 0;
-    let reachedOldest = false;
-    let cursor = 0; /* 0=最新页；之后=已抓到的最小评论ID，向更早翻 */
+    let complete = false;
+    let cursor = 0; /* 0=最新页；之后=上一窗的最小评论ID，逐窗向更早翻 */
     while (pages < maxPages) {
       const url = `https://t.me/${t.tgChannel || channel}/${t.tgMid}?embed=1&discussion=1` + (cursor ? `&comment=${cursor}` : '');
-      let list = [];
+      let html = '';
       try {
         const rr = await fetch(url, TG_UA);
-        if (rr.ok) list = parseComments(await rr.text());
+        if (rr.ok) html = await rr.text();
       } catch (e) { break; }
       pages++;
-      if (!list.length) { reachedOldest = true; break; }
+      /* TG 有时会按出口 IP 返回 JS 壳页（"Please open Telegram"，评论不直出）：这不是翻到底，
+         绝不能标完成，否则帖子会被永久误判"评论已同步完"、之后的新评论再也进不来（2026-10-11 实锤：热帖 43 条评论只进了 5 条就被标 done） */
+      if (!html || html.includes('Please open Telegram')) break;
+      const list = parseComments(html);
+      if (!list.length) { complete = true; break; }        /* 真空页 = 翻到底 */
       let pageMin = Infinity;
+      let newOnPage = 0;
       for (const c of list) {
         if (c.cid < pageMin) pageMin = c.cid;
         if (c.cid < minSeen) minSeen = c.cid;
         if (seen.has(c.cid)) continue;
         seen.add(c.cid);
-        const cleanText = stripTgLinks(c.text); /* 电报链接过滤：剥掉 t.me 等链接，只剩链接的评论整条跳过 */
+        newOnPage++;
+        const cleanText = stripSourceSignature(stripTgLinks(c.text)); /* 电报链接过滤 + 源频道签名尾巴过滤：只剩链接/签名的评论整条跳过 */
         if (!cleanText && !c.image) continue;   /* 纯表情/贴纸/纯链接跳过（ID 已记，不会重复抓） */
+        if (isNmBotComment(c)) { botCommentsSkipped++; continue; } /* 机器人 nmBot 的评论不搬（2026-10-09 用户定） */
         if (TG_AD_RE.test(cleanText)) continue; /* 广告评论不搬 */
+        if (TG_COMMENT_AD_RE.test(cleanText)) { commentAdsSkipped++; continue; } /* 推广按钮式广告评论不搬 */
         fresh.push({ ...c, text: cleanText });
       }
-      if (cursor !== 0 && pageMin >= cursor) { reachedOldest = true; break; } /* 锚点页没再变老 = 到最老一条 */
-      cursor = pageMin;
-      /* 续传：之前已抓到过更老的地方时，从最新页直接跳回上次的最老处继续往下，不重复翻已抓的窗口 */
-      if (pages === 1 && t.tgCommentMin && cursor > t.tgCommentMin) cursor = t.tgCommentMin;
+      if (pageMin < walkMin) walkMin = pageMin;
+      if (frontier0 && pageMin <= frontier0) { complete = true; break; }  /* 接上历史最老前沿，无缝 */
+      if (cursor !== 0 && pageMin >= cursor) { complete = true; break; }   /* 锚点窗不再变老 = 到最老一条 */
+      if (wasDone && !t.tgCommentWalk && pages === 1 && newOnPage === 0) break; /* 刷新：最新窗无新评论，收工 */
+      if (wasDone && !t.tgCommentWalk && pageMin <= startMax) break;           /* 刷新：已接上已知最新段 */
+      /* 续传：上次没走完的下行前沿（前沿之上都已抓过）直接接上，不重翻已抓窗口、也不留缝 */
+      if (pages === 1 && t.tgCommentWalk && t.tgCommentWalk > frontier0 && pageMin <= startMax) cursor = t.tgCommentWalk;
+      else cursor = pageMin;
     }
     fresh.sort((a, b) => a.cid - b.cid);
     for (const c of fresh) {
@@ -4498,10 +5302,17 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     }
     t.tgCommentIds = [...seen].slice(-400);
     if (minSeen !== Infinity) t.tgCommentMin = minSeen;
+    t.tgCommentCheckedAt = Date.now();
+    if (complete) { t.tgCommentsDone = true; t.tgCommentWalk = 0; t.tgRequeue = false; }
+    else {
+      /* 预算内没走完：记住下行前沿下轮续传；回补中的帖不许被标完成 */
+      if (pages >= maxPages && walkMin !== Infinity && walkMin > frontier0) t.tgCommentWalk = walkMin;
+      if (!wasDone || t.tgRequeue) t.tgCommentsDone = false;
+    }
+    if ((t.tgCommentIds || []).length >= 200) { t.tgCommentsDone = true; t.tgCommentWalk = 0; t.tgRequeue = false; }
     /* 阅读数托底（用户定）：多少人评论就至少多少人看过 */
     const commenters = new Set(t.posts.slice(1).map(p => p.authorName || p.userId));
     if (commenters.size > (t.viewCount || 0)) t.viewCount = commenters.size;
-    if (reachedOldest || (t.tgCommentIds || []).length >= 200) t.tgCommentsDone = true;
     if (fresh.length || pages) commentTopics++;
   }
   /* 社区小助手：给零回复的新帖搭第一句话（官方助手号，帖主会收到回复通知） */
@@ -4598,7 +5409,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   } catch (e) { console.error('社区小助手失败:', e.message); }
   saveDb(db);
   await flushNow(); /* 立即落盘，防 serverless 冻结丢数据 */
-  res.json({ ok: true, assisted, firstRun, synced: synced.length, backfilled, legacyBackfilled, legacyDone: state.legacy ? !!state.legacy.done : true, legacyOldestId: state.legacy ? state.legacy.oldestId : 0, skippedAds, commentsAdded, commentTopics, backfillDone: !!state.done, oldestId: state.oldestId, lastId: state.lastId, migrated, migrations: migReport, saveError: lastKvError || null, sizes: { bytes: (() => { try { return JSON.stringify(db).length; } catch (e) { return -1; } })(), topics: db.topics.length, posts: db.topics.reduce((a, t) => a + ((t.posts || []).length), 0), companies: (db.companies || []).length, users: (db.users || []).length } });
+  res.json({ ok: true, assisted, firstRun, synced: synced.length, backfilled, legacyBackfilled, legacyDone: state.legacy ? !!state.legacy.done : true, legacyOldestId: state.legacy ? state.legacy.oldestId : 0, skippedAds, newsDedup: newsDedupHits, linkPostSkips, commentsAdded, botCommentsSkipped, commentAdsSkipped, commentTopics, backfillDone: !!state.done, oldestId: state.oldestId, lastId: state.lastId, migrated, migrations: migReport, saveError: lastKvError || null, sizes: { bytes: (() => { try { return JSON.stringify(db).length; } catch (e) { return -1; } })(), topics: db.topics.length, posts: db.topics.reduce((a, t) => a + ((t.posts || []).length), 0), companies: (db.companies || []).length, users: (db.users || []).length } });
 });
 
 
@@ -4718,6 +5529,7 @@ app.post('/api/cron/trendradar-post', express.json({ limit: '512kb' }), async (r
    分类映射表（可改）：按数组顺序先匹配更垂直的项目，最后 football/basketball 两大球，
    都不命中再按综合体育兜底词判断。关键词按标题子串匹配（英文转小写后比对）。 */
 const SPORT_BOARD_EMOJI = { basketball: '🏀', football: '⚽', tennis: '🎾', badminton: '🏸', pingpong: '🏓', volleyball: '🏐', billiards: '🎱', baseball: '⚾', golf: '⛳', esports: '🎮', sports: '🏅' };
+const SPORT_BOARD_NAMES = { basketball: '篮球', football: '足球', tennis: '网球', badminton: '羽毛球', pingpong: '乒乓球', volleyball: '排球', billiards: '台球', baseball: '棒球', golf: '高尔夫', esports: '电竞', sports: '体育' };
 const SPORT_SLUG_ORDER = ['basketball', 'football', 'tennis', 'badminton', 'pingpong', 'volleyball', 'billiards', 'baseball', 'golf', 'esports', 'sports'];
 const SPORT_BOARD_KEYWORDS = [
   ['pingpong', ['乒乓球', '乒联', '世乒赛', 'wtt', '马龙', '樊振东', '孙颖莎', '王楚钦', '陈梦', '林诗栋']],
@@ -4820,9 +5632,9 @@ app.post('/api/cron/sports-seed', express.json({ limit: '512kb' }), async (req, 
     if (arr.length < 8 && !arr.some(x => x.title === it.title)) arr.push(it); /* 每帖最多 8 条、按标题去重 */
   }
   /* 零帖板块优先：按现存帖数升序处理（每板同日仍只 1 帖，上限逻辑不变） */
+  const sportsBoard = db.boards.find(b => b.slug === 'sports');
   const entries = [...groups.entries()].map(([slug, arr]) => {
-    const board = db.boards.find(b => b.slug === slug);
-    return board ? { slug, board, arr } : null;
+    return sportsBoard ? { slug, board: sportsBoard, arr } : null;
   }).filter(Boolean).sort((a, b) => (a.board.topicCount || 0) - (b.board.topicCount || 0));
   const boards = {};
   let created = 0;
@@ -4830,15 +5642,16 @@ app.post('/api/cron/sports-seed', express.json({ limit: '512kb' }), async (req, 
     const seedKey = `sports:${day}:${slug}`;
     if (db.topics.some(t => t.seedKey === seedKey)) { boards[slug] = 'exists'; continue; }
     const emoji = SPORT_BOARD_EMOJI[slug] || '🏅';
-    const title = `${emoji} ${board.name}今日热点 · ${dateTag}`;
+    const sportName = SPORT_BOARD_NAMES[slug] || '体育';
+    const title = `${emoji} ${sportName}今日热点 · ${dateTag}`;
     const lines = arr.map((x, i) => `${i + 1}. ${x.url ? `[${x.title}](${x.url})` : x.title}`);
-    const content = `> 🤖 自动同步体育资讯：内容聚合自${fetched.hupu !== undefined ? ' 虎扑/微博/头条热榜（NewsNow 聚合，与 TrendRadar 同源）' : '外部推送的当日体育热点'}，由官方机器人「体育快讯」自动同步整理，非真人发帖，仅供球迷交流。\n\n## ${emoji} 今日${board.name}热点\n\n${lines.join('\n')}\n\n---\n📌 本板块每天自动同步 1 篇热点，其余时间欢迎真人发帖：聊比赛、评球员、发战报、约球都行。`;
+    const content = `> 🤖 自动同步体育资讯：内容聚合自${fetched.hupu !== undefined ? ' 虎扑/微博/头条热榜（NewsNow 聚合，与 TrendRadar 同源）' : '外部推送的当日体育热点'}，由官方机器人「体育快讯」自动同步整理，非真人发帖，仅供球迷交流。\n\n## ${emoji} 今日${sportName}热点\n\n${lines.join('\n')}\n\n---\n📌 本板块每天自动同步 1 篇热点，其余时间欢迎真人发帖：聊比赛、评球员、发战报、约球都行。`;
     const time = nowIso();
     const topicId = id('tp');
     db.topics.push({
       id: topicId, title, slug: uniqueSlug(slugify(title), db.topics), boardId: board.id, userId: bot.id,
       createdAt: time, bumpedAt: time, viewCount: 0, replyCount: 0, likeCount: 0, favoriteCount: 0, favoritedUsers: [],
-      tags: ['体育资讯', board.name], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
+      tags: ['体育资讯', sportName], posts: [{ id: id('p'), topicId, userId: bot.id, content, createdAt: time, likeCount: 0, postNumber: 1 }],
       pinned: false, recommended: false, price: 0, closed: false,
       poll: null, bounty: 0, bestReplyId: null,
       prefix: '体育', status: 'published', seedKey,
@@ -4877,7 +5690,7 @@ const BOARD_WELCOME_TEMPLATES = {
   baseball: { scope: 'MLB、日职棒与世界棒球经典赛，棒球小众但同好不孤单。', demo: '《大谷翔平又双叒叕刷新纪录了》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇棒球热点。' },
   golf: { scope: '大满贯与 PGA，挥杆人生，装备与球场体验也聊。', demo: '《周末下场记：第一次抓鸟，纪念一下》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇高尔夫热点。' },
   esports: { scope: 'LOL、CS2、王者荣耀与 DOTA2：比赛复盘、版本讨论、开黑组队。', demo: '《LPL 季后赛这手 BP，把对面算死了》', rules: '理性讨论不引战、不带选手节奏；官方号「体育快讯」每日自动同步 1 篇电竞热点。' },
-  sports: { scope: '田径、游泳、F1 与健身等综合体育，没单独板块的项目都在这。', demo: '《马拉松首马完赛记录：3 小时 58 分》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步 1 篇综合体育热点。' },
+  sports: { scope: '足球、篮球、网球、羽毛球、乒乓球、排球、台球、棒球、高尔夫、电竞……所有运动项目都在这。', demo: '《欧冠之夜：这场绝杀我能吹一年》《周末野球场被虐惨了，但过人那下我自己都惊了》', rules: '理性讨论不引战；官方号「体育快讯」每日自动同步各项目热点。' },
 };
 function boardWelcomeContent(board) {
   const tpl = BOARD_WELCOME_TEMPLATES[board.slug] || {
@@ -5265,7 +6078,7 @@ app.post('/api/admin/topics/:id/slowmode', requireAdmin, (req, res) => {
   res.json({ ok: true, slowMode: sec });
 });
 
-app.delete('/api/admin/topics/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/topics/:id', requireAdmin, async (req, res) => {
   const db = loadDb();
   const idx = db.topics.findIndex(t => t.id === req.params.id || t.slug === req.params.id);
   if (idx < 0) return res.status(404).json({ error: '帖子不存在' });
@@ -5276,6 +6089,8 @@ app.delete('/api/admin/topics/:id', requireAdmin, (req, res) => {
   db.users.forEach(u => { const f = u.favorites || []; const fi = f.indexOf(t.id); if (fi >= 0) f.splice(fi, 1); });
   modLog(db, '删除帖子', req.user, '', `删除帖子《${t.title}》`);
   saveDb(db);
+  /* 关键写立即落盘（与 approve/tg-review reject 同口径）：只靠 1200ms 延迟写会在实例冻结/回收时丢掉，删帖表现为「点了没反应/帖子还在」 */
+  await flushNow();
   res.json({ ok: true });
 });
 
