@@ -3651,7 +3651,18 @@ async function collectDbStats(forceSnap) {
       } catch { creds = []; }
     } catch { history = []; }
   }
-  return { dbs: out, history, creds };
+  /* 80% 预警：存储或带宽任一达到 80% 即告警，供外部 cron 读到后发 TG */
+  const alerts = [];
+  for (const d of out) {
+    if (!d.ok) continue;
+    const memPct = (d.usedMemory != null && d.maxMemory) ? d.usedMemory / d.maxMemory : null;
+    const bwPct = (d.bandwidthBytes != null && d.bandwidthLimitBytes) ? d.bandwidthBytes / d.bandwidthLimitBytes : null;
+    const hits = [];
+    if (memPct != null && memPct >= 0.8) hits.push({ metric: 'memory', pct: Math.round(memPct * 100) });
+    if (bwPct != null && bwPct >= 0.8) hits.push({ metric: 'bandwidth', pct: Math.round(bwPct * 100) });
+    if (hits.length) alerts.push({ name: d.name, label: d.label || d.name, hits });
+  }
+  return { dbs: out, history, creds, alerts };
 }
 app.get('/api/admin/db-stats', requireAdmin, async (req, res) => {
   res.json(await collectDbStats(req.query.snap === '1'));
@@ -3679,7 +3690,7 @@ app.get('/api/cron/dbmon-snap', async (req, res) => {
   const authOk = secret && (req.headers.authorization === `Bearer ${secret}` || req.headers['x-sync-secret'] === secret || req.query.secret === secret);
   if (!authOk) return res.status(401).json({ error: 'unauthorized' });
   const r = await collectDbStats(true);
-  res.json({ ok: true, dbs: r.dbs.length, snaps: r.history.length, creds: (r.creds || []).length });
+  res.json({ ok: true, dbs: r.dbs.length, snaps: r.history.length, creds: (r.creds || []).length, alerts: r.alerts || [] });
 });
 
 /* 14 日趋势：每日新增用户 / 主题 / 回复 */
@@ -5894,7 +5905,7 @@ app.get('/api/admin/codes', requireAdmin, (req, res) => {
   res.json({ codes, total: codes.length, used: codes.filter(c => c.usedBy).length, available: codes.filter(c => !c.usedBy).length });
 });
 
-app.post('/api/admin/codes', requireAdmin, (req, res) => {
+app.post('/api/admin/codes', requireAdmin, async (req, res) => {
   const db = loadDb();
   const { count = 1, note = '' } = req.body || {};
   const n = Math.min(Math.max(parseInt(count, 10) || 1, 1), 50);
@@ -5905,12 +5916,13 @@ app.post('/api/admin/codes', requireAdmin, (req, res) => {
     created.push(rc);
   }
   saveDb(db);
+  await flushNow();
   res.status(201).json({ codes: created });
 });
 
 /* ================= 用户邀请码 ================= */
 /* 生成邀请码：LV2+ 用户可生成，每码默认 5 次使用 */
-app.post('/api/invites', requireAuth, (req, res) => {
+app.post('/api/invites', requireAuth, async (req, res) => {
   const db = loadDb();
   const lv = userLevel(req.user).level;
   if (lv < 2) return res.status(403).json({ error: 'LV2 及以上才能生成邀请码，多发帖回帖升级吧' });
@@ -5920,6 +5932,7 @@ app.post('/api/invites', requireAuth, (req, res) => {
   const rc = { id: id('rc'), code: genRegCode(), note: String(((req.body || {}).note) || '').slice(0, 50), createdBy: req.user.id, maxUses, usedCount: 0, usedByList: [], usedBy: null, usedAt: null, createdAt: nowIso(), expiresAt: null };
   db.regCodes.push(rc);
   saveDb(db);
+  await flushNow();
   res.status(201).json({ code: rc.code, maxUses: rc.maxUses });
 });
 /* 我的邀请码 + 邀请统计 */
@@ -5933,13 +5946,14 @@ app.get('/api/invites/mine', requireAuth, (req, res) => {
   res.json({ codes, totalInvited, rewardPerInvite: 20 });
 });
 
-app.delete('/api/admin/codes/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/codes/:id', requireAdmin, async (req, res) => {
   const db = loadDb();
   const idx = (db.regCodes || []).findIndex(c => c.id === req.params.id);
   if (idx < 0) return res.status(404).json({ error: '注册码不存在' });
   if (db.regCodes[idx].usedBy) return res.status(400).json({ error: '该注册码已被使用，不能删除' });
   db.regCodes.splice(idx, 1);
   saveDb(db);
+  await flushNow();
   res.json({ ok: true });
 });
 
