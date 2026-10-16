@@ -4510,6 +4510,8 @@ app.post('/api/integrations/tg-migrate', async (req, res) => {
       anonymous: !!body.anonymous,
       /* classify：逐帖关键词归类到各板块（资讯频道用）；sinceTs：只搬该时间点之后的帖（只回填今天用） */
       classify: !!body.classify,
+      /* board：整个频道固定进指定板块（传板块 slug，如 chigua 吃瓜区）；非法值忽略 */
+      boardSlug: (() => { const s = String(body.board || '').trim(); return db.boards.some(b => b.slug === s) ? s : ''; })(),
       sinceTs: parseSinceTs(body.sinceTs),
       lastId: initLast, oldestId: initOldest, done: !!mids.length && initOldest <= 1, emptyHits: 0,
       registeredAt: nowIso(),
@@ -4518,6 +4520,7 @@ app.post('/api/integrations/tg-migrate', async (req, res) => {
     if (body.tag !== undefined) existing.tag = String(body.tag || '').slice(0, 20);
     if (body.anonymous !== undefined) existing.anonymous = !!body.anonymous;
     if (body.classify !== undefined) existing.classify = !!body.classify;
+    if (body.board !== undefined) { const s = String(body.board || '').trim(); existing.boardSlug = db.boards.some(b => b.slug === s) ? s : ''; }
     if (body.sinceTs !== undefined) existing.sinceTs = parseSinceTs(body.sinceTs);
     if (body.resume) { existing.done = false; existing.emptyHits = 0; }
     /* 进度覆盖（补搬缺口用）：把 oldestId 拨回缺口上方并置 done=false，同步轮次会向下逐页补齐 */
@@ -5006,7 +5009,11 @@ app.get('/api/cron/tg-sync', async (req, res) => {
        非归类频道（树洞系）一律进树洞板，行为与从前一致 */
     let targetBoard = board;
     let boardTag = '树洞';
-    if (opts.classify) {
+    if (opts.boardSlug) {
+      /* 固定板块频道（如 fa_dian → 吃瓜区）：整个频道直接进指定板块，不走逐帖归类 */
+      const fixed = db.boards.find(b => b.slug === opts.boardSlug);
+      if (fixed) { targetBoard = fixed; boardTag = fixed.name; }
+    } else if (opts.classify) {
       const hitSlug = classifyTgPostBoard(p.text);
       const hit = hitSlug ? db.boards.find(b => b.slug === hitSlug) : null;
       const fallback = db.boards.find(b => b.slug === 'daily');
@@ -5030,7 +5037,7 @@ app.get('/api/cron/tg-sync', async (req, res) => {
     }
     const time = p.at && !isNaN(new Date(p.at).getTime()) ? new Date(p.at).toISOString() : nowIso();
     const flat = p.text.replace(/\s+/g, ' ').trim();
-    const title = flat ? flat.slice(0, 30) : '树洞图片投稿';
+    const title = flat ? flat.slice(0, 30) : (boardTag === '树洞' ? '树洞图片投稿' : boardTag + '图片投稿');
     const cleanText = stripSourceSignature(stripTgLinks(p.text)); /* 电报链接过滤 + 源频道签名尾巴过滤（用户定） */
     /* 搬移帖不加来源备注行（2026-10-04 用户定），正文就是原内容 */
     const body = cleanText + (p.image ? `\n\n![](${p.image})` : '');
@@ -5145,7 +5152,9 @@ app.get('/api/cron/tg-sync', async (req, res) => {
   const migReport = {};
   for (const [migChannel, mig] of Object.entries(db.tgMigrations)) {
     if (!mig) continue;
-    const migOpts = { tags: ['树洞', ...(mig.tag ? [mig.tag] : [])], anonymous: !!mig.anonymous, source: 'import', classify: !!mig.classify, sinceTs: mig.sinceTs || 0, channelTag: mig.tag || '' };
+    /* 固定板块频道（如 fa_dian → 吃瓜区）：标签用板块名 + 频道标签，不套"树洞" */
+    const fixedBoard = mig.boardSlug ? db.boards.find(b => b.slug === mig.boardSlug) : null;
+    const migOpts = { tags: [fixedBoard ? fixedBoard.name : '树洞', ...(mig.tag ? [mig.tag] : [])], anonymous: !!mig.anonymous, source: 'import', classify: !!mig.classify, boardSlug: mig.boardSlug || '', sinceTs: mig.sinceTs || 0, channelTag: mig.tag || '' };
     try {
       const rm = await fetch(`https://t.me/s/${migChannel}`, TG_UA);
       if (rm.ok) {
